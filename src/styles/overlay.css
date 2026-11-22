@@ -1,0 +1,43 @@
+html,
+body.overlay-body {
+  background: transparent !important;
+  margin: 0;
+  padding: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.overlay-root {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  pointer-events: none;
+}
+
+.overlay-stage {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.overlay-pet-slot {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  pointer-events: auto;
+  will-change: transform;
+  cursor: grab;
+  touch-action: none;
+}
+
+.overlay-pet-slot.dragging {
+  cursor: grabbing;
+  z-index: 60;
+}
+
+.overlay-pet-slot .speech-bubble {
+  pointer-events: auto;
+  cursor: default;
+}

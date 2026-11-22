@@ -1,0 +1,61 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Boymoder AI Assistant",
+  "version": "0.1.0",
+  "identifier": "com.boymoder.ai-assistant",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Boymoder AI Assistant",
+        "url": "index.html",
+        "width": 980,
+        "height": 760,
+        "minWidth": 460,
+        "minHeight": 580,
+        "resizable": true,
+        "visible": true
+      },
+      {
+        "label": "overlay",
+        "title": "Boymoder Desktop Pet",
+        "url": "overlay.html",
+        "width": 1200,
+        "height": 720,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "resizable": false,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:*; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "resources": [
+      "../assets/pets/**/*"
+    ]
+  }
+}

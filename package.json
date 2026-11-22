@@ -1,0 +1,26 @@
+{
+  "name": "boymoder-ai-assistant",
+  "version": "0.1.0",
+  "description": "A lightweight desktop pet AI orchestrator and coding assistant powered by OpenCode",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/engine.test.ts",
+    "generate:pets": "node scripts/generate-pets.mjs",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.19.6",
+    "@tauri-apps/api": "^2.5.0",
+    "@tauri-apps/plugin-dialog": "^2.2.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.5.0",
+    "typescript": "^5.8.0",
+    "vite": "^6.3.0"
+  }
+}

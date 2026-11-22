@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Boymoder AI Assistant</title>
+    <link rel="stylesheet" href="/src/styles/shared.css" />
+    <link rel="stylesheet" href="/src/styles/main.css" />
+  </head>
+  <body>
+    <div id="app" class="ds-shell">
+      <!-- ChatGPT-Style Left Collapsible Sidebar -->
+      <aside id="sidebar" class="ds-sidebar" aria-label="Boymoder AI Assistant Sidebar">
+        <div class="ds-sidebar-header">
+          <span class="ds-brand-wordmark">Boymoder AI</span>
+          <div class="ds-header-icons">
+            <button
+              id="btn-search-toggle"
+              class="ds-icon-btn"
+              type="button"
+              title="Search chats and projects"
+              aria-label="Search"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8" />
+                <line x1="21" y1="21" x2="16.65" y2="16.65" />
+              </svg>
+            </button>
+            <button
+              id="btn-collapse-sidebar"
+              class="ds-icon-btn"
+              type="button"
+              title="Collapse sidebar"
+              aria-label="Collapse sidebar"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="18" height="18" rx="3" />
+                <line x1="9" y1="3" x2="9" y2="21" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div id="sidebar-search-wrap" class="ds-search-wrap" hidden>
+          <input id="sidebar-search-input" type="text" placeholder="Search projects or chats..." />
+        </div>
+
+        <div class="ds-sidebar-actions">
+          <button id="btn-new-chat" class="ds-new-chat-row" type="button">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 20h9" />
+              <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+            </svg>
+            <span>New chat</span>
+          </button>
+          <button id="btn-open-stats" class="ds-sidebar-nav-btn" type="button">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="20" x2="18" y2="10" />
+              <line x1="12" y1="20" x2="12" y2="4" />
+              <line x1="6" y1="20" x2="6" y2="14" />
+            </svg>
+            <span>Statistics</span>
+          </button>
+        </div>
+
+        <!-- Projects | Chats Tab Switcher -->
+        <div class="ds-sidebar-tabs" role="tablist">
+          <button id="tab-projects" class="ds-sidebar-tab active" type="button" role="tab" aria-selected="true">
+            Projects
+          </button>
+          <button id="tab-chats" class="ds-sidebar-tab" type="button" role="tab" aria-selected="false">
+            Chats
+          </button>
+        </div>
+
+        <div class="ds-sidebar-scroll">
+          <!-- Projects Tab Panel -->
+          <div id="panel-projects" class="ds-tab-panel">
+            <div class="ds-section-row">
+              <span class="ds-nav-label">Projects</span>
+              <button id="btn-add-project" class="ds-mini-action" type="button" title="Add project folder">
+                + Add
+              </button>
+            </div>
+            <div id="projects-tree" class="ds-projects-tree"></div>
+            <div id="projects-empty" class="ds-history-empty" hidden>
+              No projects added yet. Click + Add to select a folder.
+            </div>
+          </div>
+
+          <!-- Chats Tab Panel -->
+          <div id="panel-chats" class="ds-tab-panel" hidden>
+            <div id="active-threads-group" class="ds-nav-group" hidden>
+              <div class="ds-nav-label">Active Pets</div>
+              <div id="active-subagent-nav" class="ds-nav-list"></div>
+            </div>
+            <div class="ds-nav-label">Recents</div>
+            <div id="recents-list" class="ds-nav-list"></div>
+            <div id="history-empty" class="ds-history-empty">
+              No chats yet.
+            </div>
+          </div>
+        </div>
+
+        <!-- Bottom Left Corner: Pets On/Off + TPS + Agents Count + Settings -->
+        <div class="ds-sidebar-footer">
+          <div class="ds-footer-card">
+            <div class="ds-footer-metrics" aria-live="off">
+              <span id="tps-badge" class="ds-metric-pill" title="Tokens per second">0.0 tok/s</span>
+              <span id="agents-badge" class="ds-metric-pill" title="Active agents">0 agents</span>
+            </div>
+            <div class="ds-footer-actions">
+              <button id="btn-toggle-roam" class="ds-footer-pill" type="button" title="Toggle Desktop Pets">
+                Pets On
+              </button>
+              <button id="btn-open-settings" class="ds-icon-btn ds-icon-btn-sm" type="button" title="Settings" aria-label="Settings">
+                <span class="ds-status-dot ds-settings-dot" id="conn-dot"></span>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="3" />
+                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <div id="sidebar-backdrop" class="ds-sidebar-backdrop" hidden></div>
+
+      <!-- Center Main Stream + Bottom Composer -->
+      <main class="ds-main">
+        <header class="ds-topbar">
+          <div class="ds-topbar-left">
+            <button
+              id="btn-expand-sidebar"
+              class="ds-icon-btn"
+              type="button"
+              title="Open sidebar"
+              aria-label="Open sidebar"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="18" height="18" rx="3" />
+                <line x1="9" y1="3" x2="9" y2="21" />
+              </svg>
+            </button>
+            <span id="topbar-title" class="ds-topbar-title">Boymoder AI Assistant</span>
+            <span id="topbar-workspace" class="ds-topbar-ws"></span>
+          </div>
+          <div class="ds-topbar-right">
+            <span id="phase-badge" class="ds-phase-pill">Ready</span>
+            <button id="btn-clear-resting" class="ds-text-btn" type="button" hidden>Clear pets</button>
+          </div>
+        </header>
+
+        <div id="center-scroll" class="ds-center-scroll">
+          <div class="ds-stream-col">
+            <!-- Empty / Welcome State -->
+            <section id="welcome-state" class="ds-welcome">
+              <div class="ds-welcome-pet">
+                <div class="pet-node kind-orchestrator state-idle">
+                  <div class="pet-sprite-wrap">
+                    <img id="welcome-sprite" class="pet-sprite ds-welcome-sprite-img" alt="Boymoder" />
+                  </div>
+                </div>
+              </div>
+              <h1 class="ds-welcome-heading">h-hey... how can I orchestrate your codebase today?</h1>
+            </section>
+
+            <!-- Active Chat Thread -->
+            <section id="thread-state" class="ds-thread" hidden>
+              <div id="turns-list" class="ds-turns-list"></div>
+
+              <!-- Collapsible Execution Plan (Orchestration mode) -->
+              <details id="plan-accordion" class="ds-thought-accordion" hidden>
+                <summary class="ds-thought-summary">
+                  <span class="ds-thought-left">
+                    <svg class="ds-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                      <polyline points="9 18 15 12 9 6" />
+                    </svg>
+                    <span class="ds-thought-icon">✦</span>
+                    <span id="thought-title">Execution Plan</span>
+                  </span>
+                  <span id="thought-timer" class="ds-thought-timer"></span>
+                </summary>
+                <div class="ds-thought-body">
+                  <div id="plan-items-list" class="ds-plan-items"></div>
+                  <div id="log-list" class="ds-log-list"></div>
+                </div>
+              </details>
+
+              <!-- Inline Pet Stage Strip (hidden completely when desktop overlay is active) -->
+              <div id="stage-card" class="ds-stage-strip-wrap">
+                <div id="docked-stage" class="ds-pet-stage"></div>
+              </div>
+
+              <!-- Inline Permission Approval Cards -->
+              <div id="permissions-panel" class="ds-permissions-wrap" hidden>
+                <div id="permissions-list" class="ds-permissions-list"></div>
+              </div>
+            </section>
+
+            <!-- Statistics Page View -->
+            <section id="stats-view" class="ds-stats-view" hidden></section>
+          </div>
+        </div>
+
+        <!-- Bottom Floating Pill Composer -->
+        <div class="ds-composer-outer" id="composer-outer">
+          <div class="ds-composer-pill" id="composer-pill">
+            <textarea
+              id="goal-input"
+              rows="1"
+              placeholder="Message Boymoder..."
+            ></textarea>
+            <div class="ds-composer-toolbar">
+              <div class="ds-composer-toggles">
+                <!-- Animated multi-colored mode selector -->
+                <div class="ds-mode-group" id="mode-group" data-active="plan" role="group" aria-label="Mode">
+                  <span class="ds-mode-thumb" id="mode-thumb"></span>
+                  <button class="ds-mode-seg" type="button" data-mode="build">Build</button>
+                  <button class="ds-mode-seg active" type="button" data-mode="plan">Plan</button>
+                  <button class="ds-mode-seg" type="button" data-mode="orchestration">Orchestration</button>
+                </div>
+
+                <!-- Searchable Subscription Model & Thinking Switcher -->
+                <div class="ds-model-controls">
+                  <div class="ds-model-picker" id="model-picker">
+                    <button
+                      id="btn-model-trigger"
+                      class="ds-model-trigger"
+                      type="button"
+                      title="Select AI model by subscription"
+                    >
+                      <span id="model-trigger-label" class="ds-model-trigger-label">Default model</span>
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="6 9 12 15 18 9" />
+                      </svg>
+                    </button>
+                    <div id="model-popover" class="ds-model-popover" hidden>
+                      <div class="ds-model-search-box">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                          <circle cx="11" cy="11" r="8" />
+                          <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                        </svg>
+                        <input id="model-search-input" type="text" placeholder="Search models or subscriptions..." />
+                      </div>
+                      <div id="model-list" class="ds-model-list"></div>
+                    </div>
+                  </div>
+                  <div class="ds-model-picker" id="variant-picker">
+                    <button
+                      id="btn-variant-trigger"
+                      class="ds-model-trigger ds-variant-trigger"
+                      type="button"
+                      title="Select thinking depth"
+                    >
+                      <span id="variant-trigger-label" class="ds-model-trigger-label">auto</span>
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="6 9 12 15 18 9" />
+                      </svg>
+                    </button>
+                    <div id="variant-popover" class="ds-model-popover ds-variant-popover" hidden>
+                      <div class="ds-variant-pop-head">Thinking Depth</div>
+                      <div id="variant-list" class="ds-model-list"></div>
+                    </div>
+                  </div>
+                </div>
+
+                <button
+                  id="btn-pill-worktree"
+                  class="ds-mode-pill active"
+                  type="button"
+                  aria-pressed="true"
+                  title="Isolate parallel sub-agents into separate git worktrees"
+                  hidden
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="6" y1="3" x2="6" y2="15" />
+                    <circle cx="18" cy="6" r="3" />
+                    <circle cx="6" cy="18" r="3" />
+                    <path d="M18 9a9 9 0 0 1-9 9" />
+                  </svg>
+                  <span>Worktree</span>
+                </button>
+              </div>
+
+              <button
+                id="btn-send-stop"
+                class="ds-send-btn"
+                type="button"
+                title="Send message (Enter)"
+                disabled
+              >
+                <svg id="icon-send" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="12" y1="19" x2="12" y2="5" />
+                  <polyline points="5 12 12 5 19 12" />
+                </svg>
+                <svg id="icon-stop" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" hidden>
+                  <rect x="4" y="4" width="16" height="16" rx="3" />
+                </svg>
+                <span id="label-stop" class="ds-stop-label" hidden>Stop</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="ds-modal-backdrop" hidden>
+      <div class="ds-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <div class="ds-modal-header">
+          <h2 id="settings-title">Settings</h2>
+          <button id="btn-close-settings" class="ds-icon-btn" type="button" aria-label="Close settings">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+
+        <div class="ds-modal-body">
+          <div class="ds-settings-section">
+            <h3>General</h3>
+            <div class="ds-setting-row">
+              <div>
+                <div class="ds-setting-label">Appearance</div>
+                <div class="ds-setting-desc">Switch between Charcoal Dark and Clean Light themes</div>
+              </div>
+              <select id="set-theme" class="ds-setting-select">
+                <option value="dark">Dark</option>
+                <option value="light">Light</option>
+              </select>
+            </div>
+            <div class="ds-setting-row">
+              <div>
+                <div class="ds-setting-label">Workspace Path</div>
+                <div class="ds-setting-desc">Active project directory</div>
+              </div>
+              <div class="ds-setting-inline">
+                <input id="set-workspace-input" class="ds-setting-input" type="text" placeholder="/path/to/project" />
+                <button id="btn-set-browse" class="ds-btn-secondary" type="button">Browse</button>
+              </div>
+            </div>
+            <div class="ds-setting-row">
+              <div>
+                <div class="ds-setting-label">Git Worktree Isolation</div>
+                <div class="ds-setting-desc">Isolate parallel Orchestration pets in separate worktrees</div>
+              </div>
+              <input id="chk-set-worktrees" class="ds-switch" type="checkbox" checked />
+            </div>
+          </div>
+
+          <div class="ds-settings-section">
+            <h3>Desktop Pets</h3>
+            <div class="ds-setting-row">
+              <div>
+                <div class="ds-setting-label">Desktop Overlay</div>
+                <div class="ds-setting-desc">Place pets on taskbar / bottom of screen (drag anywhere to move)</div>
+              </div>
+              <input id="chk-set-overlay" class="ds-switch" type="checkbox" checked />
+            </div>
+            <div class="ds-setting-row">
+              <div>
+                <div class="ds-setting-label">Launch Pets on Taskbar at Startup</div>
+                <div class="ds-setting-desc">Automatically show desktop pets when Boymoder AI Assistant opens</div>
+              </div>
+              <input id="chk-set-autolaunch" class="ds-switch" type="checkbox" />
+            </div>
+            <div class="ds-setting-row">
+              <div>
+                <div class="ds-setting-label">Always on Top</div>
+                <div class="ds-setting-desc">Keep pets above every application window</div>
+              </div>
+              <input id="chk-set-ontop" class="ds-switch" type="checkbox" checked />
+            </div>
+            <div class="ds-setting-row">
+              <div>
+                <div class="ds-setting-label">Pet Size Scale</div>
+                <div class="ds-setting-desc" id="set-scale-label">100%</div>
+              </div>
+              <input id="range-set-scale" class="ds-range" type="range" min="75" max="135" step="5" value="100" />
+            </div>
+            <div class="ds-setting-row">
+              <div>
+                <div class="ds-setting-label">Wayland Interactive Fallback</div>
+                <div class="ds-setting-desc">Keep full overlay clickable if compositor blocks region hit-testing</div>
+              </div>
+              <input id="chk-force-interactive" class="ds-switch" type="checkbox" />
+            </div>
+            <div class="ds-setting-row">
+              <div>
+                <div class="ds-setting-label">Custom Pet Sprites</div>
+                <div class="ds-setting-desc">Reload PNGs from <code>assets/pets/</code></div>
+              </div>
+              <button id="btn-reload-sprites" class="ds-btn-secondary" type="button">Reload Sprites</button>
+            </div>
+          </div>
+
+          <div class="ds-settings-section">
+            <h3>OpenCode Backend</h3>
+            <div class="ds-setting-row">
+              <div>
+                <div class="ds-setting-label">Server Status</div>
+                <div class="ds-setting-desc" id="set-server-url">Checking...</div>
+              </div>
+              <button id="btn-set-reconnect" class="ds-btn-secondary" type="button">Reconnect</button>
+            </div>
+            <div class="ds-setting-row">
+              <div>
+                <div class="ds-setting-label">Clear Chat History</div>
+                <div class="ds-setting-desc">Remove saved conversations from sidebar</div>
+              </div>
+              <button id="btn-clear-history" class="ds-btn-danger-outline" type="button">Clear History</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Chat Context Menu -->
+    <div id="chat-context-menu" class="ds-ctx-menu" role="menu" hidden></div>
+
+    <script type="module" src="/src/ui/main.ts"></script>
+  </body>
+</html>
