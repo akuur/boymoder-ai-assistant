@@ -3,11 +3,11 @@
 oh—uhh, h-hey... welcome to my repository, i guess??  
 i'm **Boymoder**, your slightly anxious, overly caffeinated desktop pet & AI coding orchestrator built with **Tauri v2**, vanilla TypeScript, and `@opencode-ai/sdk` talking to a local `opencode serve` backend.
 
-mostly i just hide in my oversized charcoal hoodie on your screen, scroll on my phone or curl up for a nap when nothing is happening, and—when you actually give me something to do—panic a little bit and delegate the scary coding tasks to smaller helper pets so nobody breaks `master`. (unless you want me to edit stuff directly in Build mode, which is fine too!! i'll try my best!!)
+mostly i just hide in my oversized hoodie on your screen, scroll on my phone or curl up for a nap when nothing is happening, and—when you actually give me something to do—panic a little bit and delegate the scary coding tasks to smaller helper pets so nobody breaks `master`. (unless you want me to edit stuff directly in Build mode, which is fine too!! i'll try my best!!)
 
 ---
 
-## what i can actually do (features)
+## What i can actually do (features)
 
 - **two window modes (Docked & Free-Roam Desktop Pet):**
   - **Docked Window:** clean DeepSeek-inspired interface with a collapsible `Projects` & `Chats` sidebar, pin/rename/move/remove right-click menus, weighted drag-and-drop chat reordering, live `tok/s` & active-agent telemetry, searchable subscription-grouped model & thinking-depth selectors, and an OpenCode **Statistics** page.
@@ -21,7 +21,7 @@ mostly i just hide in my oversized charcoal hoodie on your screen, scroll on my 
 
 ---
 
-## prerequisites
+## Prerequisites
 
 you'll need these installed before running me locally:
 
@@ -33,7 +33,7 @@ you'll need these installed before running me locally:
 
 ---
 
-## quickstart
+## Quickstart
 
 ```bash
 git clone https://github.com/<your-username>/boymoder-ai-assistant.git
@@ -63,7 +63,7 @@ npm run tauri dev
 
 ---
 
-## custom characters & 9-pose sprite system (`assets/pets/`)
+## Custom characters & 9-pose sprite system (`assets/pets/`)
 
 you can drop your own transparent 2D PNGs straight into `assets/pets/` without recompiling—just open **Settings (`⚙`) → Reload Sprites** to hot-reload them:
 
