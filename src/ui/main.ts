@@ -10,6 +10,8 @@ import {
 import { PetOrchestratorEngine } from "../engine/orchestrator";
 import { PetSpriteRegistry } from "../engine/pets";
 import type {
+  BackendConfig,
+  BackendId,
   ChatTurn,
   ExecutionMode,
   ModelOption,
@@ -42,7 +44,13 @@ interface RunHistoryItem {
   planItems: SubtaskPlanItem[];
   planDurationMs?: number;
   assistantReply?: string;
-  subagents: Array<{ role: string; title: string; statusText: string; lastOutput?: string }>;
+  subagents: Array<{
+    role: string;
+    title: string;
+    statusText: string;
+    lastOutput?: string;
+    spriteVariant?: string;
+  }>;
 }
 
 const THEME_STORAGE_KEY = "akuur_theme";
@@ -53,9 +61,13 @@ const PROJECT_NAMES_KEY = "akuur_project_names_v1";
 const MODEL_STORAGE_KEY = "akuur_selected_model";
 const AUTO_PETS_KEY = "akuur_auto_pets";
 const PET_SCALE_KEY = "akuur_pet_scale";
+const ACTIVE_BACKEND_KEY = "akuur_active_backend";
+const BACKEND_CONFIGS_KEY = "akuur_backend_configs_v1";
 
 const sprites = new PetSpriteRegistry();
-const engine = new PetOrchestratorEngine("http://127.0.0.1:4096");
+const engine = new PetOrchestratorEngine("http://127.0.0.1:4096", {
+  pickSubagentVariant: (role, idx) => sprites.pickSubagentVariant(role, idx),
+});
 
 const shellEl = document.getElementById("app")!;
 const welcomeSprite = document.getElementById("welcome-sprite") as HTMLImageElement;
@@ -88,6 +100,9 @@ const btnOpenSettings = document.getElementById("btn-open-settings") as HTMLButt
 
 const topbarTitle = document.getElementById("topbar-title")!;
 const topbarWorkspace = document.getElementById("topbar-workspace")!;
+const backendPicker = document.getElementById("backend-picker")!;
+const backendStatusDot = document.getElementById("backend-status-dot")!;
+const backendSelect = document.getElementById("backend-select") as HTMLSelectElement;
 const tpsBadge = document.getElementById("tps-badge")!;
 const phaseBadge = document.getElementById("phase-badge")!;
 const btnClearResting = document.getElementById("btn-clear-resting") as HTMLButtonElement;
@@ -143,8 +158,23 @@ const rangeSetScale = document.getElementById("range-set-scale") as HTMLInputEle
 const setScaleLabel = document.getElementById("set-scale-label")!;
 const chkForceInteractive = document.getElementById("chk-force-interactive") as HTMLInputElement;
 const btnReloadSprites = document.getElementById("btn-reload-sprites") as HTMLButtonElement;
+const setActiveBackend = document.getElementById("set-active-backend") as HTMLSelectElement;
+const setBackendStatusBadge = document.getElementById("set-backend-status-badge")!;
+const backendPanelOpencode = document.getElementById("backend-panel-opencode")!;
+const backendPanelCli = document.getElementById("backend-panel-cli")!;
+const backendPanelOpenai = document.getElementById("backend-panel-openai")!;
+const setOpencodeUrl = document.getElementById("set-opencode-url") as HTMLInputElement;
 const setServerUrl = document.getElementById("set-server-url")!;
 const btnSetReconnect = document.getElementById("btn-set-reconnect") as HTMLButtonElement;
+const setCliStatusDesc = document.getElementById("set-cli-status-desc")!;
+const btnRecheckCli = document.getElementById("btn-recheck-cli") as HTMLButtonElement;
+const setCliModel = document.getElementById("set-cli-model") as HTMLInputElement;
+const setCliPath = document.getElementById("set-cli-path") as HTMLInputElement;
+const setOpenaiBaseUrl = document.getElementById("set-openai-base-url") as HTMLInputElement;
+const setOpenaiApiKey = document.getElementById("set-openai-api-key") as HTMLInputElement;
+const setOpenaiModel = document.getElementById("set-openai-model") as HTMLInputElement;
+const setOpenaiStatusDesc = document.getElementById("set-openai-status-desc")!;
+const btnTestOpenai = document.getElementById("btn-test-openai") as HTMLButtonElement;
 const btnClearHistory = document.getElementById("btn-clear-history") as HTMLButtonElement;
 const chatContextMenu = document.getElementById("chat-context-menu")!;
 
@@ -361,6 +391,7 @@ function syncActiveChatHistory(snap: OrchestratorSnapshot): void {
       title: s.title,
       statusText: s.statusText,
       lastOutput: s.lastOutput,
+      spriteVariant: s.spriteVariant,
     }));
     selectedHistoryId = existing.id;
     historyItems = sortPinnedFirst(historyItems);
@@ -385,6 +416,7 @@ function syncActiveChatHistory(snap: OrchestratorSnapshot): void {
       title: s.title,
       statusText: s.statusText,
       lastOutput: s.lastOutput,
+      spriteVariant: s.spriteVariant,
     })),
   };
 
@@ -894,6 +926,7 @@ function buildNestedChatBtn(item: RunHistoryItem): HTMLElement {
                   title: s.title,
                   statusText: s.statusText,
                   lastOutput: s.lastOutput,
+                  spriteVariant: s.spriteVariant,
                 })),
               },
             ];
@@ -1118,7 +1151,47 @@ function renderSidebar(snap: OrchestratorSnapshot): void {
   agentsBadge.classList.toggle("has-agents", activeAgents > 0);
 }
 
+function getBackendStatusLabel(snap: OrchestratorSnapshot, id: BackendId): {
+  ready: boolean;
+  label: string;
+} {
+  const avail = snap.backendAvailability?.[id];
+  const ready = avail ? avail.available : id === (snap.activeBackend ?? "opencode") && snap.serverHealthy;
+  if (ready) return { ready: true, label: "Ready" };
+  if (id === "claude-code" || id === "codex-cli") {
+    return { ready: false, label: "Not installed" };
+  }
+  return { ready: false, label: "Offline" };
+}
+
+function renderBackendControls(snap: OrchestratorSnapshot): void {
+  const active = snap.activeBackend ?? "opencode";
+  const avail = snap.backendAvailability?.[active];
+  const { ready, label } = getBackendStatusLabel(snap, active);
+
+  if (document.activeElement !== backendSelect) {
+    backendSelect.value = active;
+  }
+  backendStatusDot.classList.toggle("online", ready);
+  backendStatusDot.classList.toggle("offline", !ready);
+  backendPicker.title = `${avail?.label ?? active}: ${label}${avail?.error ? ` (${avail.error})` : ""}`;
+}
+
 function renderModelControls(snap: OrchestratorSnapshot): void {
+  const activeBackend = snap.activeBackend ?? "opencode";
+  if (activeBackend !== "opencode") {
+    modelPopover.hidden = true;
+    variantPopover.hidden = true;
+    variantPicker.hidden = true;
+    const cfgModel = snap.backendConfigs?.[activeBackend]?.model?.trim();
+    modelTriggerLabel.textContent = cfgModel || "Default model";
+    btnModelTrigger.title = "Configure model in Settings → AI Backends";
+    return;
+  }
+
+  variantPicker.hidden = false;
+  btnModelTrigger.title = "Select AI model by subscription";
+
   const models = snap.availableModels;
   const activeModel = models.find(
     (m) =>
@@ -1393,7 +1466,11 @@ function renderTurns(snap: OrchestratorSnapshot): void {
           const text = sub.errorText ?? sub.lastOutput ?? sub.statusText;
           block.appendChild(
             buildAgentMessageBlock({
-              avatarUrl: sprites.resolveSpriteUrl("subagent", sub.role, sub.state),
+              avatarUrl: sprites.resolveSpriteUrl(
+                "subagent",
+                sub.spriteVariant || sub.role,
+                sub.state
+              ),
               role: `${sub.role} · ${sub.title}`,
               meta: sub.worktreeBranch ? `${sub.statusText} · ${sub.worktreeBranch}` : sub.statusText,
               text,
@@ -1421,7 +1498,11 @@ function renderTurns(snap: OrchestratorSnapshot): void {
         const text = sub.errorText ?? sub.lastOutput ?? sub.statusText;
         block.appendChild(
           buildAgentMessageBlock({
-            avatarUrl: sprites.resolveSpriteUrl("subagent", sub.role, sub.errorText ? "error" : "idle"),
+            avatarUrl: sprites.resolveSpriteUrl(
+              "subagent",
+              sub.spriteVariant || sub.role,
+              sub.errorText ? "error" : "idle"
+            ),
             role: `${sub.role} · ${sub.title}`,
             meta: sub.worktreeBranch ? `${sub.statusText} · ${sub.worktreeBranch}` : sub.statusText,
             text,
@@ -1471,7 +1552,9 @@ function renderThoughtTimer(snap: OrchestratorSnapshot): void {
 }
 
 function renderSettingsModal(snap: OrchestratorSnapshot): void {
-  setWorkspaceInput.value = snap.workspaceDir;
+  if (document.activeElement !== setWorkspaceInput) {
+    setWorkspaceInput.value = snap.workspaceDir;
+  }
   chkSetWorktrees.checked = snap.useWorktrees;
   chkSetOverlay.checked = snap.freeRoam;
   chkSetOnTop.checked = snap.alwaysOnTop;
@@ -1479,9 +1562,57 @@ function renderSettingsModal(snap: OrchestratorSnapshot): void {
   const pct = Math.round((snap.petScale || 1) * 100);
   rangeSetScale.value = String(pct);
   setScaleLabel.textContent = `${pct}%`;
-  setServerUrl.textContent = snap.serverHealthy
+
+  const active = snap.activeBackend ?? "opencode";
+  const { ready, label } = getBackendStatusLabel(snap, active);
+  if (document.activeElement !== setActiveBackend) {
+    setActiveBackend.value = active;
+  }
+  setBackendStatusBadge.textContent = label;
+  setBackendStatusBadge.classList.toggle("ready", ready);
+  setBackendStatusBadge.classList.toggle("unavailable", !ready);
+
+  backendPanelOpencode.hidden = active !== "opencode";
+  backendPanelCli.hidden = active !== "claude-code" && active !== "codex-cli";
+  backendPanelOpenai.hidden = active !== "openai-compat";
+
+  const ocAvail = snap.backendAvailability?.opencode;
+  const ocHealthy = ocAvail ? ocAvail.available : active === "opencode" && snap.serverHealthy;
+  setServerUrl.textContent = ocHealthy
     ? `Connected at ${snap.serverUrl}`
     : `Disconnected (${snap.serverUrl})`;
+  if (document.activeElement !== setOpencodeUrl) {
+    setOpencodeUrl.value = snap.backendConfigs?.opencode?.serverUrl ?? snap.serverUrl;
+  }
+
+  if (active === "claude-code" || active === "codex-cli") {
+    const cliAvail = snap.backendAvailability?.[active];
+    const cliCfg = snap.backendConfigs?.[active];
+    setCliStatusDesc.textContent = cliAvail?.available
+      ? `Ready: ${cliAvail.binary ?? active}${cliAvail.version ? ` (${cliAvail.version})` : ""}${cliAvail.path ? ` · ${cliAvail.path}` : ""}`
+      : `Not installed${cliAvail?.error ? ` · ${cliAvail.error}` : ""}`;
+    if (document.activeElement !== setCliModel) {
+      setCliModel.value = cliCfg?.model ?? "";
+    }
+    if (document.activeElement !== setCliPath) {
+      setCliPath.value = cliCfg?.cliPath ?? "";
+    }
+  }
+
+  const oaAvail = snap.backendAvailability?.["openai-compat"];
+  const oaCfg = snap.backendConfigs?.["openai-compat"];
+  if (document.activeElement !== setOpenaiBaseUrl) {
+    setOpenaiBaseUrl.value = oaCfg?.baseUrl ?? "http://127.0.0.1:8000/v1";
+  }
+  if (document.activeElement !== setOpenaiApiKey) {
+    setOpenaiApiKey.value = oaCfg?.apiKey ?? "";
+  }
+  if (document.activeElement !== setOpenaiModel) {
+    setOpenaiModel.value = oaCfg?.model ?? "";
+  }
+  setOpenaiStatusDesc.textContent = oaAvail?.available
+    ? `Ready (${oaCfg?.baseUrl || "connected"})`
+    : `Offline${oaAvail?.error ? ` · ${oaAvail.error}` : ""}`;
 }
 
 function paintStatsView(): void {
@@ -1532,6 +1663,7 @@ function render(snap: OrchestratorSnapshot): void {
 
   syncActiveChatHistory(snap);
   renderSidebar(snap);
+  renderBackendControls(snap);
   renderModelControls(snap);
   renderSettingsModal(snap);
 
@@ -1688,6 +1820,34 @@ async function init(): Promise<void> {
     engine.setSelectedModel(savedModel);
   }
 
+  const savedConfigs = loadJson<Partial<Record<BackendId, BackendConfig>>>(
+    BACKEND_CONFIGS_KEY,
+    {}
+  );
+  for (const id of ["opencode", "claude-code", "codex-cli", "openai-compat"] as BackendId[]) {
+    const cfg = savedConfigs[id];
+    if (cfg) {
+      const { apiKey: _apiKey, ...safeCfg } = cfg;
+      engine.updateBackendConfig(id, safeCfg);
+    }
+  }
+  setOpenaiApiKey.placeholder = "sk-... (session only)";
+
+  let initialBackend: BackendId = "opencode";
+  try {
+    const savedBackend = localStorage.getItem(ACTIVE_BACKEND_KEY);
+    if (
+      savedBackend === "opencode" ||
+      savedBackend === "claude-code" ||
+      savedBackend === "codex-cli" ||
+      savedBackend === "openai-compat"
+    ) {
+      initialBackend = savedBackend;
+    }
+  } catch {
+    // Ignore
+  }
+
   // Pets are OFF by default unless user explicitly enabled startup auto-launch
   const autoLaunchPets = localStorage.getItem(AUTO_PETS_KEY) === "true";
   chkSetAutoLaunch.checked = autoLaunchPets;
@@ -1789,6 +1949,18 @@ async function init(): Promise<void> {
   // Searchable Model & Thinking Depth Popovers
   btnModelTrigger.addEventListener("click", (e) => {
     e.stopPropagation();
+    const activeBackend = engine.getActiveBackendId();
+    if (activeBackend !== "opencode") {
+      modelPopover.hidden = true;
+      variantPopover.hidden = true;
+      settingsModal.hidden = false;
+      if (activeBackend === "openai-compat") {
+        setOpenaiModel.focus();
+      } else {
+        setCliModel.focus();
+      }
+      return;
+    }
     variantPopover.hidden = true;
     modelPopover.hidden = !modelPopover.hidden;
     if (!modelPopover.hidden) {
@@ -1892,9 +2064,100 @@ async function init(): Promise<void> {
     await broadcastSprites(updated);
     render(engine.getSnapshot());
   });
+  const persistBackendConfigs = () => {
+    const configs = engine.getSnapshot().backendConfigs;
+    if (!configs) return;
+    const toPersist: Partial<Record<BackendId, BackendConfig>> = {};
+    for (const [id, cfg] of Object.entries(configs) as Array<[BackendId, BackendConfig]>) {
+      const { apiKey: _apiKey, ...rest } = cfg;
+      toPersist[id] = rest;
+    }
+    saveJson(BACKEND_CONFIGS_KEY, toPersist);
+  };
+
+  const switchBackend = async (next: BackendId) => {
+    if (
+      next !== "opencode" &&
+      next !== "claude-code" &&
+      next !== "codex-cli" &&
+      next !== "openai-compat"
+    ) {
+      return;
+    }
+    try {
+      localStorage.setItem(ACTIVE_BACKEND_KEY, next);
+    } catch {
+      // Ignore
+    }
+    await engine.setBackend(next);
+  };
+
+  backendSelect.addEventListener("change", () => {
+    void switchBackend(backendSelect.value as BackendId);
+  });
+  setActiveBackend.addEventListener("change", () => {
+    void switchBackend(setActiveBackend.value as BackendId);
+  });
+
+  setOpencodeUrl.addEventListener("change", () => {
+    const url = setOpencodeUrl.value.trim();
+    if (url) {
+      engine.updateBackendConfig("opencode", { serverUrl: url });
+      persistBackendConfigs();
+    }
+  });
   btnSetReconnect.addEventListener("click", () => {
+    const url = setOpencodeUrl.value.trim();
+    if (url) {
+      engine.updateBackendConfig("opencode", { serverUrl: url });
+      persistBackendConfigs();
+    }
     void engine.startAndConnectServer();
   });
+
+  setCliModel.addEventListener("input", () => {
+    const active = engine.getActiveBackendId();
+    if (active === "claude-code" || active === "codex-cli") {
+      engine.updateBackendConfig(active, { model: setCliModel.value });
+      persistBackendConfigs();
+    }
+  });
+  setCliPath.addEventListener("change", () => {
+    const active = engine.getActiveBackendId();
+    if (active === "claude-code" || active === "codex-cli") {
+      engine.updateBackendConfig(active, { cliPath: setCliPath.value.trim() });
+      persistBackendConfigs();
+      void engine.checkConnection();
+    }
+  });
+  btnRecheckCli.addEventListener("click", () => {
+    const active = engine.getActiveBackendId();
+    if (active === "claude-code" || active === "codex-cli") {
+      engine.updateBackendConfig(active, {
+        cliPath: setCliPath.value.trim(),
+        model: setCliModel.value,
+      });
+      persistBackendConfigs();
+    }
+    void engine.checkConnection();
+  });
+
+  const syncOpenAiConfig = () => {
+    engine.updateBackendConfig("openai-compat", {
+      baseUrl: setOpenaiBaseUrl.value,
+      apiKey: setOpenaiApiKey.value,
+      model: setOpenaiModel.value,
+    });
+    persistBackendConfigs();
+  };
+  setOpenaiBaseUrl.addEventListener("input", syncOpenAiConfig);
+  setOpenaiApiKey.addEventListener("input", syncOpenAiConfig);
+  setOpenaiModel.addEventListener("input", syncOpenAiConfig);
+  btnTestOpenai.addEventListener("click", () => {
+    syncOpenAiConfig();
+    void engine.checkConnection();
+  });
+
   btnClearHistory.addEventListener("click", () => {
     historyItems = [];
     saveJson(HISTORY_STORAGE_KEY, []);
@@ -1950,7 +2213,12 @@ async function init(): Promise<void> {
     void toggleDesktopPets(true).catch(() => {});
   }
 
-  await engine.startAndConnectServer();
+  if (initialBackend === "opencode") {
+    await engine.startAndConnectServer();
+  } else {
+    await engine.setBackend(initialBackend);
+  }
+  void engine.checkAllBackends();
   setInterval(() => {
     if (!welcomeState.hidden) {
       renderWelcomeSprite(engine.getSnapshot());

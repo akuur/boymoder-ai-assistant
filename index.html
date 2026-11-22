@@ -147,6 +147,15 @@
             <span id="topbar-workspace" class="ds-topbar-ws"></span>
           </div>
           <div class="ds-topbar-right">
+            <div class="ds-backend-picker" id="backend-picker" title="Active AI Backend">
+              <span class="ds-status-dot ds-backend-dot" id="backend-status-dot"></span>
+              <select id="backend-select" class="ds-backend-select" aria-label="Active AI Backend">
+                <option value="opencode">OpenCode</option>
+                <option value="claude-code">Claude Code</option>
+                <option value="codex-cli">Codex CLI</option>
+                <option value="openai-compat">Hermes / OpenAI API</option>
+              </select>
+            </div>
             <span id="phase-badge" class="ds-phase-pill">Ready</span>
             <button id="btn-clear-resting" class="ds-text-btn" type="button" hidden>Clear pets</button>
           </div>
@@ -398,20 +407,99 @@
           </div>
 
           <div class="ds-settings-section">
-            <h3>OpenCode Backend</h3>
-            <div class="ds-setting-row">
-              <div>
-                <div class="ds-setting-label">Server Status</div>
-                <div class="ds-setting-desc" id="set-server-url">Checking...</div>
+            <h3>AI Backends</h3>
+            <div class="ds-settings-card">
+              <div class="ds-setting-row">
+                <div>
+                  <div class="ds-setting-label">Active Backend</div>
+                  <div class="ds-setting-desc">Switch live between OpenCode, CLI agents, or OpenAI-compatible APIs</div>
+                </div>
+                <div class="ds-setting-inline">
+                  <span id="set-backend-status-badge" class="ds-backend-badge">Checking...</span>
+                  <select id="set-active-backend" class="ds-setting-select">
+                    <option value="opencode">OpenCode</option>
+                    <option value="claude-code">Claude Code</option>
+                    <option value="codex-cli">Codex CLI</option>
+                    <option value="openai-compat">Hermes / OpenAI API</option>
+                  </select>
+                </div>
               </div>
-              <button id="btn-set-reconnect" class="ds-btn-secondary" type="button">Reconnect</button>
-            </div>
-            <div class="ds-setting-row">
-              <div>
-                <div class="ds-setting-label">Clear Chat History</div>
-                <div class="ds-setting-desc">Remove saved conversations from sidebar</div>
+
+              <div id="backend-panel-opencode" class="ds-backend-subpanel">
+                <div class="ds-setting-row">
+                  <div>
+                    <div class="ds-setting-label">OpenCode Server</div>
+                    <div class="ds-setting-desc" id="set-server-url">Checking...</div>
+                  </div>
+                  <div class="ds-setting-inline">
+                    <input id="set-opencode-url" class="ds-setting-input" type="text" placeholder="http://127.0.0.1:4096" />
+                    <button id="btn-set-reconnect" class="ds-btn-secondary" type="button">Reconnect</button>
+                  </div>
+                </div>
               </div>
-              <button id="btn-clear-history" class="ds-btn-danger-outline" type="button">Clear History</button>
+
+              <div id="backend-panel-cli" class="ds-backend-subpanel" hidden>
+                <div class="ds-setting-row">
+                  <div>
+                    <div class="ds-setting-label">CLI Availability</div>
+                    <div class="ds-setting-desc" id="set-cli-status-desc">Checking CLI binary...</div>
+                  </div>
+                  <button id="btn-recheck-cli" class="ds-btn-secondary" type="button">Re-check CLI</button>
+                </div>
+                <div class="ds-setting-row">
+                  <div>
+                    <div class="ds-setting-label">CLI Model</div>
+                    <div class="ds-setting-desc">Optional model override (leave blank for CLI default)</div>
+                  </div>
+                  <input id="set-cli-model" class="ds-setting-input" type="text" placeholder="Default model" />
+                </div>
+                <div class="ds-setting-row">
+                  <div>
+                    <div class="ds-setting-label">Custom CLI Directory</div>
+                    <div class="ds-setting-desc">Optional folder containing the CLI binary if not on PATH</div>
+                  </div>
+                  <input id="set-cli-path" class="ds-setting-input" type="text" placeholder="/usr/local/bin" />
+                </div>
+              </div>
+
+              <div id="backend-panel-openai" class="ds-backend-subpanel" hidden>
+                <div class="ds-setting-row">
+                  <div>
+                    <div class="ds-setting-label">API Base URL</div>
+                    <div class="ds-setting-desc">OpenAI-compatible endpoint (Hermes, vLLM, Ollama, LM Studio)</div>
+                  </div>
+                  <input id="set-openai-base-url" class="ds-setting-input" type="text" placeholder="http://127.0.0.1:8000/v1" />
+                </div>
+                <div class="ds-setting-row">
+                  <div>
+                    <div class="ds-setting-label">API Key</div>
+                    <div class="ds-setting-desc">Optional Bearer token</div>
+                  </div>
+                  <input id="set-openai-api-key" class="ds-setting-input" type="password" placeholder="sk-... (optional)" />
+                </div>
+                <div class="ds-setting-row">
+                  <div>
+                    <div class="ds-setting-label">Model Name</div>
+                    <div class="ds-setting-desc">Model identifier served by the endpoint</div>
+                  </div>
+                  <input id="set-openai-model" class="ds-setting-input" type="text" placeholder="e.g. hermes-3-llama-3.1-70b" />
+                </div>
+                <div class="ds-setting-row">
+                  <div>
+                    <div class="ds-setting-label">Endpoint Status</div>
+                    <div class="ds-setting-desc" id="set-openai-status-desc">Not checked yet</div>
+                  </div>
+                  <button id="btn-test-openai" class="ds-btn-secondary" type="button">Test Connection</button>
+                </div>
+              </div>
+
+              <div class="ds-setting-row">
+                <div>
+                  <div class="ds-setting-label">Clear Chat History</div>
+                  <div class="ds-setting-desc">Remove saved conversations from sidebar</div>
+                </div>
+                <button id="btn-clear-history" class="ds-btn-danger-outline" type="button">Clear History</button>
+              </div>
             </div>
           </div>
         </div>

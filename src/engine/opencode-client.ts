@@ -6,8 +6,8 @@ import {
   type V2Event,
 } from "@opencode-ai/sdk/v2/client";
 import { invoke } from "@tauri-apps/api/core";
-import { extractTextFromParts, extractTextFromV2Content } from "./planner";
-import type { ModelOption, SelectedModelRef, SessionStatsData } from "./types";
+import { extractTextFromParts, extractTextFromV2Content } from "./planner.ts";
+import type { ModelOption, SelectedModelRef, SessionStatsData } from "./types.ts";
 
 export type ApiMode = "v2" | "v1";
 

@@ -1,5 +1,5 @@
 import type { Part, SessionMessageAssistant } from "@opencode-ai/sdk/v2/client";
-import type { SubtaskPlanItem } from "./types";
+import type { SubtaskPlanItem } from "./types.ts";
 
 export const PLANNER_SYSTEM_PROMPT = `You are Boymoder's task planner.
 Your ONLY job right now is to decompose the user's goal into 1 to 4 independent, non-overlapping subtasks that parallel worker pets can execute.

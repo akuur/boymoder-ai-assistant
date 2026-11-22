@@ -171,3 +171,88 @@ test("parseMarkdownBlocks splits headings, lists, code fences, and paragraphs", 
   assert.equal(blocks[3].lang, "bash");
   assert.equal(blocks[3].text, "npm test");
 });
+
+test("PetSpriteRegistry resolves 5-state productive Glegle sprites and fallbacks", () => {
+  const registry = new PetSpriteRegistry();
+  registry.setPack({
+    rootPath: "assets/pets",
+    orchestrator: {
+      idle: "orch-idle",
+      work: "orch-work",
+    },
+    subagents: {
+      default: {
+        idle: "def-idle",
+        work: "def-work",
+        sleep: "def-sleep",
+        alert: "def-alert",
+        happy: "def-happy",
+      },
+      "glegle-1": {
+        idle: "g1-idle",
+        work: "g1-work",
+        sleep: "g1-sleep",
+        alert: "g1-alert",
+        happy: "g1-happy",
+      },
+    },
+  });
+
+  // Exact 5 productive states resolve directly
+  assert.equal(registry.resolveSpriteUrl("subagent", "glegle-1", "idle"), "g1-idle");
+  assert.equal(registry.resolveSpriteUrl("subagent", "glegle-1", "work"), "g1-work");
+  assert.equal(registry.resolveSpriteUrl("subagent", "glegle-1", "sleep"), "g1-sleep");
+  assert.equal(registry.resolveSpriteUrl("subagent", "glegle-1", "alert"), "g1-alert");
+  assert.equal(registry.resolveSpriteUrl("subagent", "glegle-1", "happy"), "g1-happy");
+
+  // Missing legacy/extended states fall back cleanly
+  assert.equal(registry.resolveSpriteUrl("subagent", "glegle-1", "walk"), "g1-work");
+  assert.equal(registry.resolveSpriteUrl("subagent", "glegle-1", "fall"), "g1-alert");
+  assert.equal(registry.resolveSpriteUrl("subagent", "glegle-1", "sit"), "g1-idle");
+  assert.equal(registry.resolveSpriteUrl("subagent", "glegle-1", "error"), "g1-alert");
+});
+
+test("PetSpriteRegistry discovers and rotates across multi-variant Glegle subagents", () => {
+  const registry = new PetSpriteRegistry();
+
+  // Multi-variant pack with glegle-1 and glegle-2 alongside default
+  registry.setPack({
+    rootPath: "assets/pets",
+    orchestrator: { idle: "orch-idle" },
+    subagents: {
+      default: { idle: "def-idle", work: "def-work", sleep: "def-sleep", alert: "def-alert", happy: "def-happy" },
+      "glegle-2": { idle: "g2-idle", work: "g2-work", sleep: "g2-sleep", alert: "g2-alert", happy: "g2-happy" },
+      "glegle-1": { idle: "g1-idle", work: "g1-work", sleep: "g1-sleep", alert: "g1-alert", happy: "g1-happy" },
+    },
+  });
+
+  assert.deepEqual(registry.listSubagentVariants(), ["default", "glegle-1", "glegle-2"]);
+  assert.equal(registry.pickSubagentVariant("Execution", 0), "glegle-1");
+  assert.equal(registry.pickSubagentVariant("Execution", 1), "glegle-2");
+  assert.equal(registry.pickSubagentVariant("Execution", 2), "glegle-1");
+
+  // Explicit role folder (e.g. research) matches when present
+  registry.setPack({
+    rootPath: "assets/pets",
+    orchestrator: { idle: "orch-idle" },
+    subagents: {
+      default: { idle: "def-idle" },
+      "glegle-1": { idle: "g1-idle" },
+      "glegle-2": { idle: "g2-idle" },
+      research: { idle: "res-idle" },
+    },
+  });
+  assert.equal(registry.pickSubagentVariant("Research", 0), "research");
+  assert.equal(registry.pickSubagentVariant("Senior Research", 1), "research");
+
+  // Single default pack falls back to default
+  registry.setPack({
+    rootPath: "assets/pets",
+    orchestrator: { idle: "orch-idle" },
+    subagents: {
+      default: { idle: "def-idle" },
+    },
+  });
+  assert.deepEqual(registry.listSubagentVariants(), ["default"]);
+  assert.equal(registry.pickSubagentVariant("Execution", 0), "default");
+});

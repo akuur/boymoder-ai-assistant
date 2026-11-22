@@ -462,10 +462,11 @@ function ensureWrite(filePath, buf, force = false) {
 const force = process.argv.includes("--force");
 
 const ALL_STATES = ["idle", "walk", "work", "fall", "sit", "sleep", "happy", "alert", "error"];
+const PRODUCTIVE_SUBAGENT_STATES = ["idle", "work", "sleep", "happy", "alert"];
 
 const targets = [
   { dir: path.join(PETS_DIR, "orchestrator"), variant: "orchestrator", states: ALL_STATES },
-  { dir: path.join(PETS_DIR, "subagents", "default"), variant: "subagent", states: ALL_STATES },
+  { dir: path.join(PETS_DIR, "subagents", "default"), variant: "subagent", states: PRODUCTIVE_SUBAGENT_STATES },
 ];
 
 for (const target of targets) {

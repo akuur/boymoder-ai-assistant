@@ -1,3 +1,23 @@
+export type BackendId = "opencode" | "claude-code" | "codex-cli" | "openai-compat";
+
+export interface BackendAvailability {
+  backend: BackendId;
+  available: boolean;
+  label: string;
+  binary?: string;
+  path?: string | null;
+  version?: string;
+  error?: string;
+}
+
+export interface BackendConfig {
+  serverUrl?: string; // opencode
+  baseUrl?: string;   // openai-compat (e.g. "http://127.0.0.1:8000/v1" or "http://127.0.0.1:11434/v1")
+  apiKey?: string;    // openai-compat
+  model?: string;     // claude-code / codex-cli / openai-compat
+  cliPath?: string;   // optional custom directory or path hint
+}
+
 export type PetRoleKind = "orchestrator" | "subagent";
 
 export type PetAnimState =
@@ -56,6 +76,7 @@ export interface PetEntity {
   worktreeBranch?: string;
   completed?: boolean;
   lastOutput?: string;
+  spriteVariant?: string;
 }
 
 export interface LogEntry {
@@ -131,6 +152,7 @@ export interface ChatTurnSubagent {
   worktreeBranch?: string;
   lastOutput?: string;
   errorText?: string;
+  spriteVariant?: string;
 }
 
 export interface ChatTurn {
@@ -175,6 +197,9 @@ export interface OrchestratorSnapshot {
   subagents: PetEntity[];
   logs: LogEntry[];
   activePermissions: PendingPermission[];
+  activeBackend?: BackendId;
+  backendAvailability?: Record<BackendId, BackendAvailability>;
+  backendConfigs?: Record<BackendId, BackendConfig>;
 }
 
 export type OverlayAction =

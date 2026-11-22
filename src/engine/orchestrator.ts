@@ -1,11 +1,22 @@
 import { invoke } from "@tauri-apps/api/core";
-import { OpenCodeConnection, type AnyOpencodeEvent } from "./opencode-client";
+import {
+  ClaudeCodeBackend,
+  CodexCliBackend,
+  OpenAiCompatBackend,
+  OpenCodeBackend,
+  type AgentBackend,
+  type NormalizedAgentEvent,
+} from "../backends/index.ts";
+import { OpenCodeConnection, type AnyOpencodeEvent } from "./opencode-client.ts";
 import {
   buildPlannerPrompt,
   parseExecutionPlan,
   PLANNER_SYSTEM_PROMPT,
-} from "./planner";
+} from "./planner.ts";
 import type {
+  BackendAvailability,
+  BackendConfig,
+  BackendId,
   ChatTurn,
   ExecutionMode,
   LogEntry,
@@ -15,12 +26,50 @@ import type {
   SelectedModelRef,
   SessionStatsData,
   SubtaskPlanItem,
-} from "./types";
+} from "./types.ts";
 
 interface WorktreeInfo {
   path: string;
   branch: string;
 }
+
+export interface OrchestratorEngineDeps {
+  backends?: Partial<Record<BackendId, AgentBackend>>;
+  invokeFn?: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+  pickSubagentVariant?: (role: string, index: number) => string;
+}
+
+const DEFAULT_BACKEND_AVAILABILITY: Record<BackendId, BackendAvailability> = {
+  opencode: {
+    backend: "opencode",
+    available: false,
+    label: "OpenCode",
+  },
+  "claude-code": {
+    backend: "claude-code",
+    available: false,
+    label: "Claude Code",
+    binary: "claude",
+  },
+  "codex-cli": {
+    backend: "codex-cli",
+    available: false,
+    label: "Codex CLI",
+    binary: "codex",
+  },
+  "openai-compat": {
+    backend: "openai-compat",
+    available: false,
+    label: "Hermes / OpenAI API",
+  },
+};
+
+const ALL_BACKEND_IDS: BackendId[] = [
+  "opencode",
+  "claude-code",
+  "codex-cli",
+  "openai-compat",
+];
 
 const BOYMODER_PERSONA_SYSTEM_PROMPT = `You are Boymoder, the user's very anxious, flustered, chronically-online boymoder coding buddy.
 
@@ -52,6 +101,11 @@ function formatToolVerb(tool: string): string {
 
 export class PetOrchestratorEngine {
   private connection: OpenCodeConnection;
+  private backends: Record<BackendId, AgentBackend>;
+  private invokeFn: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+  private pickSubagentVariant?: (role: string, index: number) => string;
+  private backendUnsubscribers: Array<() => void> = [];
+  private runAbortController: AbortController | null = null;
   private snapshot: OrchestratorSnapshot;
   private listeners = new Set<(snapshot: OrchestratorSnapshot) => void>();
   private sseControllers = new Map<string, AbortController>();
@@ -66,12 +120,30 @@ export class PetOrchestratorEngine {
   private stepFirstTokenAt = new Map<string, number>();
   private stepStreamChars = new Map<string, number>();
 
-  constructor(initialUrl = "http://127.0.0.1:4096") {
-    this.connection = new OpenCodeConnection(initialUrl);
+  constructor(initialUrl = "http://127.0.0.1:4096", deps?: OrchestratorEngineDeps) {
+    this.invokeFn = deps?.invokeFn ?? invoke;
+    this.pickSubagentVariant = deps?.pickSubagentVariant;
+
+    const opencodeBackend =
+      deps?.backends?.opencode ?? new OpenCodeBackend({ serverUrl: initialUrl });
+    this.backends = {
+      opencode: opencodeBackend,
+      "claude-code": deps?.backends?.["claude-code"] ?? new ClaudeCodeBackend(),
+      "codex-cli": deps?.backends?.["codex-cli"] ?? new CodexCliBackend(),
+      "openai-compat":
+        deps?.backends?.["openai-compat"] ??
+        new OpenAiCompatBackend({ baseUrl: "http://127.0.0.1:8000/v1" }),
+    };
+
+    this.connection =
+      opencodeBackend instanceof OpenCodeBackend
+        ? opencodeBackend.getConnection()
+        : new OpenCodeConnection(initialUrl);
+
     this.snapshot = {
       connected: false,
       serverHealthy: false,
-      serverUrl: initialUrl,
+      serverUrl: this.connection.getBaseUrl(),
       workspaceDir: "",
       isGitRepo: false,
       useWorktrees: true,
@@ -108,7 +180,195 @@ export class PetOrchestratorEngine {
       subagents: [],
       logs: [],
       activePermissions: [],
+      activeBackend: "opencode",
+      backendAvailability: structuredClone(DEFAULT_BACKEND_AVAILABILITY),
+      backendConfigs: {
+        opencode: { serverUrl: this.connection.getBaseUrl() },
+        "claude-code": {},
+        "codex-cli": {},
+        "openai-compat": { baseUrl: "http://127.0.0.1:8000/v1" },
+      },
     };
+
+    for (const id of ALL_BACKEND_IDS) {
+      if (id === "opencode" && opencodeBackend instanceof OpenCodeBackend) {
+        continue;
+      }
+      const backend = this.backends[id];
+      if (typeof backend.subscribe === "function") {
+        const unsub = backend.subscribe((ev) => {
+          this.handleNormalizedEvent(id, ev);
+        });
+        this.backendUnsubscribers.push(unsub);
+      }
+    }
+  }
+
+  private async safeInvoke<T>(
+    cmd: string,
+    args?: Record<string, unknown>
+  ): Promise<T | undefined> {
+    try {
+      return await this.invokeFn<T>(cmd, args);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private isNativeOpencode(): boolean {
+    return (
+      this.getActiveBackendId() === "opencode" &&
+      this.backends.opencode instanceof OpenCodeBackend
+    );
+  }
+
+  private getUnavailableStatusText(
+    id: BackendId,
+    avail?: BackendAvailability
+  ): string {
+    if (id === "claude-code" || id === "codex-cli") {
+      return "Not installed";
+    }
+    if (id === "opencode" && avail?.error?.includes("401")) {
+      return "Auth required";
+    }
+    return "Offline";
+  }
+
+  setSubagentVariantPicker(
+    fn: ((role: string, index: number) => string) | undefined
+  ): void {
+    this.pickSubagentVariant = fn;
+  }
+
+  getActiveBackendId(): BackendId {
+    return this.snapshot.activeBackend ?? "opencode";
+  }
+
+  async setBackend(id: BackendId): Promise<void> {
+    if (this.snapshot.phase !== "idle" && this.snapshot.phase !== "error") {
+      await this.abortAll();
+    }
+    this.snapshot.activeBackend = id;
+    this.masterSessionId = null;
+    this.snapshot.sessionID = null;
+    this.snapshot.orchestrator.sessionID = null;
+    if (this.snapshot.phase === "idle" || this.snapshot.phase === "error") {
+      this.snapshot.phase = "idle";
+      this.snapshot.orchestrator.errorText = undefined;
+      this.snapshot.orchestrator.bubbleText = undefined;
+      if (
+        this.snapshot.orchestrator.state === "error" ||
+        this.snapshot.orchestrator.state === "happy"
+      ) {
+        this.snapshot.orchestrator.state = "idle";
+      }
+    }
+    await this.checkConnection();
+  }
+
+  updateBackendConfig(id: BackendId, patch: Partial<BackendConfig>): void {
+    if (!this.snapshot.backendConfigs) {
+      this.snapshot.backendConfigs = {
+        opencode: { serverUrl: this.connection.getBaseUrl() },
+        "claude-code": {},
+        "codex-cli": {},
+        "openai-compat": { baseUrl: "http://127.0.0.1:8000/v1" },
+      };
+    }
+    const next: BackendConfig = {
+      ...(this.snapshot.backendConfigs[id] ?? {}),
+      ...patch,
+    };
+    this.snapshot.backendConfigs[id] = next;
+
+    if (id === "opencode") {
+      if (patch.serverUrl !== undefined && patch.serverUrl.trim()) {
+        const cleaned = patch.serverUrl.trim();
+        this.connection.setBaseUrl(cleaned);
+        if (this.backends.opencode instanceof OpenCodeBackend) {
+          this.backends.opencode.setServerUrl(cleaned);
+        }
+        this.snapshot.serverUrl = this.connection.getBaseUrl();
+        next.serverUrl = this.snapshot.serverUrl;
+      }
+    } else if (id === "claude-code") {
+      const b = this.backends["claude-code"] as {
+        setModel?: (m?: string) => void;
+        setCliPath?: (p?: string) => void;
+      };
+      if (patch.model !== undefined && typeof b.setModel === "function") {
+        b.setModel(next.model?.trim() || undefined);
+      }
+      if (patch.cliPath !== undefined && typeof b.setCliPath === "function") {
+        b.setCliPath(next.cliPath?.trim() || undefined);
+      }
+    } else if (id === "codex-cli") {
+      const b = this.backends["codex-cli"] as {
+        setModel?: (m?: string) => void;
+        setCliPath?: (p?: string) => void;
+      };
+      if (patch.model !== undefined && typeof b.setModel === "function") {
+        b.setModel(next.model?.trim() || undefined);
+      }
+      if (patch.cliPath !== undefined && typeof b.setCliPath === "function") {
+        b.setCliPath(next.cliPath?.trim() || undefined);
+      }
+    } else if (id === "openai-compat") {
+      const b = this.backends["openai-compat"] as {
+        setConfig?: (cfg: { baseUrl?: string; apiKey?: string; model?: string }) => void;
+      };
+      if (typeof b.setConfig === "function") {
+        b.setConfig({
+          baseUrl: next.baseUrl,
+          apiKey: next.apiKey,
+          model: next.model,
+        });
+      }
+    }
+
+    this.emit();
+  }
+
+  async checkAllBackends(): Promise<Record<BackendId, BackendAvailability>> {
+    if (!this.snapshot.backendAvailability) {
+      this.snapshot.backendAvailability = structuredClone(DEFAULT_BACKEND_AVAILABILITY);
+    }
+
+    const results = await Promise.allSettled(
+      ALL_BACKEND_IDS.map(async (id) => {
+        const avail = await this.backends[id].checkAvailability();
+        return { id, avail };
+      })
+    );
+
+    for (let i = 0; i < ALL_BACKEND_IDS.length; i++) {
+      const id = ALL_BACKEND_IDS[i];
+      const res = results[i];
+      if (res.status === "fulfilled") {
+        this.snapshot.backendAvailability[id] = res.value.avail;
+      } else {
+        this.snapshot.backendAvailability[id] = {
+          ...(this.snapshot.backendAvailability[id] ?? DEFAULT_BACKEND_AVAILABILITY[id]),
+          available: false,
+          error:
+            res.reason instanceof Error ? res.reason.message : String(res.reason),
+        };
+      }
+    }
+
+    const active = this.getActiveBackendId();
+    const activeAvail = this.snapshot.backendAvailability[active];
+    this.snapshot.connected = activeAvail.available;
+    this.snapshot.serverHealthy = activeAvail.available;
+    if (this.snapshot.phase === "idle") {
+      this.snapshot.orchestrator.statusText = activeAvail.available
+        ? "Ready"
+        : this.getUnavailableStatusText(active, activeAvail);
+    }
+
+    this.emit();
+    return structuredClone(this.snapshot.backendAvailability);
   }
 
   subscribe(listener: (snap: OrchestratorSnapshot) => void): () => void {
@@ -141,9 +401,7 @@ export class PetOrchestratorEngine {
   }
 
   setServerUrl(url: string): void {
-    this.connection.setBaseUrl(url);
-    this.snapshot.serverUrl = this.connection.getBaseUrl();
-    this.emit();
+    this.updateBackendConfig("opencode", { serverUrl: url });
   }
 
   setUseWorktrees(enabled: boolean): void {
@@ -168,20 +426,17 @@ export class PetOrchestratorEngine {
 
   async setAlwaysOnTop(alwaysOnTop: boolean): Promise<void> {
     this.snapshot.alwaysOnTop = alwaysOnTop;
-    try {
-      await invoke("set_overlay_always_on_top", { alwaysOnTop });
-    } catch {
-      // Ignore if overlay isn't open
-    }
+    await this.safeInvoke("set_overlay_always_on_top", { alwaysOnTop });
     this.emit();
   }
 
   async getSessionStats(fromMs?: number): Promise<SessionStatsData | null> {
+    if (!this.isNativeOpencode()) return null;
     return this.connection.getSessionStats(fromMs);
   }
 
   async refreshModels(): Promise<void> {
-    if (!this.snapshot.serverHealthy) return;
+    if (!this.isNativeOpencode() || !this.snapshot.serverHealthy) return;
     try {
       const { models, defaultModel } = await this.connection.listModels(
         this.snapshot.workspaceDir || undefined
@@ -226,9 +481,14 @@ export class PetOrchestratorEngine {
     this.snapshot.orchestrator.state = "idle";
     this.snapshot.orchestrator.bubbleText = undefined;
     this.snapshot.orchestrator.errorText = undefined;
+    this.snapshot.orchestrator.permission = undefined;
+    const active = this.getActiveBackendId();
     this.snapshot.orchestrator.statusText = this.snapshot.serverHealthy
       ? "Ready"
-      : "Offline";
+      : this.getUnavailableStatusText(
+          active,
+          this.snapshot.backendAvailability?.[active]
+        );
     this.emit();
   }
 
@@ -255,7 +515,14 @@ export class PetOrchestratorEngine {
     this.snapshot.orchestrator.sessionID = params.sessionID;
     this.snapshot.orchestrator.state = "idle";
     this.snapshot.orchestrator.errorText = undefined;
-    this.snapshot.orchestrator.statusText = this.snapshot.serverHealthy ? "Ready" : "Offline";
+    this.snapshot.orchestrator.permission = undefined;
+    const active = this.getActiveBackendId();
+    this.snapshot.orchestrator.statusText = this.snapshot.serverHealthy
+      ? "Ready"
+      : this.getUnavailableStatusText(
+          active,
+          this.snapshot.backendAvailability?.[active]
+        );
     if (params.workspaceDir !== undefined && params.workspaceDir !== this.snapshot.workspaceDir) {
       await this.setWorkspaceDir(params.workspaceDir);
     } else {
@@ -271,49 +538,85 @@ export class PetOrchestratorEngine {
     this.snapshot.workspaceDir = trimmed;
     this.snapshot.mode = "plan";
     this.snapshot.orchestrator.directory = trimmed;
-    try {
-      this.snapshot.isGitRepo = trimmed
-        ? await invoke<boolean>("git_is_repo", { workspaceDir: trimmed })
-        : false;
-    } catch {
-      this.snapshot.isGitRepo = false;
-    }
+    this.snapshot.isGitRepo = trimmed
+      ? Boolean(await this.safeInvoke<boolean>("git_is_repo", { workspaceDir: trimmed }))
+      : false;
     this.log(
       "info",
       "Workspace",
       `Selected ${this.snapshot.workspaceDir || "(none)"} (git: ${this.snapshot.isGitRepo ? "yes" : "no"})`
     );
-    if (this.snapshot.serverHealthy && this.snapshot.workspaceDir) {
+    if (this.isNativeOpencode() && this.snapshot.serverHealthy && this.snapshot.workspaceDir) {
       this.ensureSseSubscription(this.snapshot.workspaceDir);
     }
     this.emit();
   }
 
   async checkConnection(): Promise<boolean> {
-    const health = await this.connection.checkHealth();
-    this.snapshot.serverUrl = this.connection.getBaseUrl();
-    this.snapshot.serverHealthy = health.healthy;
-    this.snapshot.connected = health.healthy;
-    if (health.healthy) {
-      if (this.snapshot.phase === "idle") {
-        this.snapshot.orchestrator.statusText = "Ready";
+    const active = this.getActiveBackendId();
+    if (!this.snapshot.backendAvailability) {
+      this.snapshot.backendAvailability = structuredClone(DEFAULT_BACKEND_AVAILABILITY);
+    }
+
+    if (this.isNativeOpencode()) {
+      const health = await this.connection.checkHealth();
+      this.snapshot.serverUrl = this.connection.getBaseUrl();
+      this.snapshot.serverHealthy = health.healthy;
+      this.snapshot.connected = health.healthy;
+      this.snapshot.backendAvailability.opencode = {
+        backend: "opencode",
+        available: health.healthy,
+        label: "OpenCode",
+        version: health.version,
+        error: health.error,
+      };
+      if (health.healthy) {
+        if (this.snapshot.phase === "idle") {
+          this.snapshot.orchestrator.statusText = "Ready";
+        }
+        if (this.snapshot.workspaceDir || this.connection.getApiMode() === "v2") {
+          this.ensureSseSubscription(this.snapshot.workspaceDir || "__global__");
+        }
+        if (this.snapshot.availableModels.length === 0) {
+          void this.refreshModels();
+        }
+      } else if (this.snapshot.phase === "idle") {
+        this.snapshot.orchestrator.statusText = health.unauthorized
+          ? "Auth required"
+          : "Offline";
       }
-      if (this.snapshot.workspaceDir || this.connection.getApiMode() === "v2") {
-        this.ensureSseSubscription(this.snapshot.workspaceDir || "__global__");
-      }
-      if (this.snapshot.availableModels.length === 0) {
-        void this.refreshModels();
-      }
-    } else if (this.snapshot.phase === "idle") {
-      this.snapshot.orchestrator.statusText = health.unauthorized
-        ? "Auth required"
-        : "Offline";
+      this.emit();
+      return health.healthy;
+    }
+
+    const backend = this.backends[active];
+    let avail: BackendAvailability;
+    try {
+      avail = await backend.checkAvailability();
+    } catch (err) {
+      avail = {
+        ...(this.snapshot.backendAvailability[active] ?? DEFAULT_BACKEND_AVAILABILITY[active]),
+        available: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+
+    this.snapshot.backendAvailability[active] = avail;
+    this.snapshot.connected = avail.available;
+    this.snapshot.serverHealthy = avail.available;
+    if (this.snapshot.phase === "idle") {
+      this.snapshot.orchestrator.statusText = avail.available
+        ? "Ready"
+        : this.getUnavailableStatusText(active, avail);
     }
     this.emit();
-    return health.healthy;
+    return avail.available;
   }
 
   async startAndConnectServer(): Promise<boolean> {
+    if (!this.isNativeOpencode()) {
+      return this.checkConnection();
+    }
     const dir = this.snapshot.workspaceDir;
     this.log("info", "Server", `Connecting to opencode serve at ${this.snapshot.serverUrl}...`);
     try {
@@ -321,6 +624,15 @@ export class PetOrchestratorEngine {
       this.snapshot.serverUrl = this.connection.getBaseUrl();
       this.snapshot.serverHealthy = health.healthy;
       this.snapshot.connected = health.healthy;
+      if (this.snapshot.backendAvailability) {
+        this.snapshot.backendAvailability.opencode = {
+          backend: "opencode",
+          available: health.healthy,
+          label: "OpenCode",
+          version: health.version,
+          error: health.error,
+        };
+      }
       if (health.healthy) {
         if (this.snapshot.phase === "idle") {
           this.snapshot.orchestrator.statusText = "Ready";
@@ -352,13 +664,25 @@ export class PetOrchestratorEngine {
   }
 
   async setWindowMode(freeRoam: boolean): Promise<void> {
-    await invoke("set_window_mode", { freeRoam });
+    try {
+      await this.invokeFn("set_window_mode", { freeRoam });
+    } catch (err) {
+      if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+        throw err;
+      }
+    }
     this.snapshot.freeRoam = freeRoam;
     this.emit();
   }
 
   async setForceInteractiveOverlay(force: boolean): Promise<void> {
-    await invoke("set_overlay_force_interactive", { force });
+    try {
+      await this.invokeFn("set_overlay_force_interactive", { force });
+    } catch (err) {
+      if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+        throw err;
+      }
+    }
     this.snapshot.forceInteractiveOverlay = force;
     this.emit();
   }
@@ -432,23 +756,45 @@ export class PetOrchestratorEngine {
     if (!trimmed) return;
 
     const gen = ++this.runGeneration;
+    this.runAbortController?.abort();
+    const runController = new AbortController();
+    this.runAbortController = runController;
 
     try {
-      const ok = await this.checkConnection();
-      if (gen !== this.runGeneration) return;
-      if (!ok) {
-        const started = await this.startAndConnectServer();
+      const nativeOpencode = this.isNativeOpencode();
+      if (nativeOpencode) {
+        const ok = await this.checkConnection();
         if (gen !== this.runGeneration) return;
-        if (!started) {
-          throw new Error("Could not connect to or start opencode serve.");
+        if (!ok) {
+          const started = await this.startAndConnectServer();
+          if (gen !== this.runGeneration) return;
+          if (!started) {
+            throw new Error("Could not connect to or start opencode serve.");
+          }
         }
+
+        await this.cleanupPreviousWorktrees();
+        if (gen !== this.runGeneration) return;
+
+        this.cleanupSseSubscriptions(true);
+        this.ensureSseSubscription(this.snapshot.workspaceDir || "__global__");
+      } else {
+        const active = this.getActiveBackendId();
+        const ok = await this.checkConnection();
+        if (gen !== this.runGeneration) return;
+        if (!ok) {
+          const avail = this.snapshot.backendAvailability?.[active];
+          throw new Error(
+            avail?.error ||
+              (active === "openai-compat"
+                ? "OpenAI-compatible endpoint is offline or unreachable."
+                : `${avail?.label ?? active} CLI is not installed or unavailable.`)
+          );
+        }
+
+        await this.cleanupPreviousWorktrees();
+        if (gen !== this.runGeneration) return;
       }
-
-      await this.cleanupPreviousWorktrees();
-      if (gen !== this.runGeneration) return;
-
-      this.cleanupSseSubscriptions(true);
-      this.ensureSseSubscription(this.snapshot.workspaceDir || "__global__");
 
       this.collectingOutputs = false;
       this.isLaunching = false;
@@ -464,6 +810,7 @@ export class PetOrchestratorEngine {
       this.snapshot.orchestrator.state = "work";
       this.snapshot.orchestrator.bubbleText = undefined;
       this.snapshot.orchestrator.errorText = undefined;
+      this.snapshot.orchestrator.permission = undefined;
 
       const mode = this.snapshot.mode;
       const turn: ChatTurn = {
@@ -486,6 +833,11 @@ export class PetOrchestratorEngine {
         this.snapshot.orchestrator.statusText = "Planning...";
       }
       this.emit();
+
+      if (!nativeOpencode) {
+        await this.submitBackendGoal(trimmed, runId, gen, runController);
+        return;
+      }
 
       // Reuse the existing session in the active chat so follow-up messages keep full context
       if (!this.masterSessionId) {
@@ -541,8 +893,9 @@ export class PetOrchestratorEngine {
           activeTurn.assistantReply = this.snapshot.assistantReply;
           activeTurn.planDurationMs = dur;
         }
+        this.clearPetPermission(this.snapshot.orchestrator);
         this.snapshot.phase = "idle";
-        this.snapshot.orchestrator.state = "idle";
+        this.snapshot.orchestrator.state = "happy";
         this.snapshot.orchestrator.statusText = "Ready";
         this.emit();
         return;
@@ -595,13 +948,274 @@ export class PetOrchestratorEngine {
         (t) => t.id === this.snapshot.currentRunId
       );
       if (activeTurn) activeTurn.errorText = msg;
+      this.clearPetPermission(this.snapshot.orchestrator);
       this.snapshot.phase = "error";
+      this.snapshot.streamingActive = false;
       this.snapshot.orchestrator.state = "error";
       this.snapshot.orchestrator.statusText = "Error";
       this.snapshot.orchestrator.errorText = msg;
       this.log("error", "Boymoder", msg);
       this.emit();
+    } finally {
+      if (this.runAbortController === runController) {
+        this.runAbortController = null;
+      }
     }
+  }
+
+  private async submitBackendGoal(
+    trimmed: string,
+    runId: string,
+    gen: number,
+    runController: AbortController
+  ): Promise<void> {
+    const active = this.getActiveBackendId();
+    const backend = this.backends[active];
+    const config = this.snapshot.backendConfigs?.[active];
+    const model = config?.model?.trim() || undefined;
+    const mode = this.snapshot.mode;
+
+    if (!this.masterSessionId) {
+      this.masterSessionId = await backend.createSession({
+        directory: this.snapshot.workspaceDir,
+        title: `Boymoder: ${trimmed.slice(0, 48)}`,
+        model,
+      });
+    }
+    if (gen !== this.runGeneration) return;
+
+    this.snapshot.sessionID = this.masterSessionId;
+    this.snapshot.orchestrator.sessionID = this.masterSessionId;
+    this.emit();
+
+    if (mode === "build" || mode === "plan") {
+      const system =
+        mode === "plan"
+          ? `${BOYMODER_PERSONA_SYSTEM_PROMPT}\n\n${PLAN_ONLY_SYSTEM_PROMPT}`
+          : BOYMODER_PERSONA_SYSTEM_PROMPT;
+
+      const reply = await backend.sendPrompt({
+        sessionID: this.masterSessionId,
+        directory: this.snapshot.workspaceDir,
+        text: trimmed,
+        system,
+        disableMutatingTools: mode === "plan",
+        model,
+        signal: runController.signal,
+        petId: "orchestrator",
+      });
+      if (gen !== this.runGeneration) return;
+
+      const dur = Math.max(
+        100,
+        Date.now() - (this.snapshot.planStartedAt ?? Date.now())
+      );
+      this.snapshot.planDurationMs = dur;
+      this.snapshot.streamingActive = false;
+      this.snapshot.assistantReply = reply || "(Done)";
+      const activeTurn = this.snapshot.turns.find((t) => t.id === runId);
+      if (activeTurn) {
+        activeTurn.assistantReply = this.snapshot.assistantReply;
+        activeTurn.planDurationMs = dur;
+      }
+      this.clearPetPermission(this.snapshot.orchestrator);
+      this.snapshot.phase = "idle";
+      this.snapshot.orchestrator.state = "happy";
+      this.snapshot.orchestrator.statusText = "Ready";
+      this.emit();
+      return;
+    }
+
+    const plannerText = await backend.sendPrompt({
+      sessionID: this.masterSessionId,
+      directory: this.snapshot.workspaceDir,
+      system: PLANNER_SYSTEM_PROMPT,
+      disableMutatingTools: true,
+      model,
+      signal: runController.signal,
+      petId: "orchestrator",
+      text: buildPlannerPrompt(
+        trimmed,
+        this.snapshot.workspaceDir,
+        this.snapshot.isGitRepo
+      ),
+    });
+    if (gen !== this.runGeneration) return;
+
+    const plan = parseExecutionPlan(plannerText, trimmed);
+    const dur = Math.max(
+      100,
+      Date.now() - (this.snapshot.planStartedAt ?? Date.now())
+    );
+    this.snapshot.planDurationMs = dur;
+    this.snapshot.planItems = plan;
+    const activeTurn = this.snapshot.turns.find((t) => t.id === runId);
+    if (activeTurn) {
+      activeTurn.planItems = plan;
+      activeTurn.planDurationMs = dur;
+    }
+    this.log(
+      "success",
+      "Planner",
+      `Delegating ${plan.length} task(s): ${plan.map((p) => p.title).join(", ")}`
+    );
+
+    await this.launchBackendSubagents(backend, plan, gen, runController.signal);
+  }
+
+  private async launchBackendSubagents(
+    backend: AgentBackend,
+    plan: SubtaskPlanItem[],
+    gen: number,
+    signal: AbortSignal
+  ): Promise<void> {
+    if (gen !== this.runGeneration) return;
+    const active = this.getActiveBackendId();
+    const model = this.snapshot.backendConfigs?.[active]?.model?.trim() || undefined;
+
+    this.isLaunching = true;
+    this.snapshot.phase = "executing";
+    this.snapshot.orchestrator.state = "work";
+    this.snapshot.orchestrator.statusText = "Building...";
+    this.emit();
+
+    const runOne = async (item: SubtaskPlanItem, index: number): Promise<void> => {
+      if (gen !== this.runGeneration) return;
+      const repoDir = this.snapshot.workspaceDir;
+      let agentDir = repoDir;
+      let wtInfo: WorktreeInfo | undefined;
+
+      if (this.snapshot.useWorktrees && this.snapshot.isGitRepo && plan.length > 1) {
+        try {
+          wtInfo = await this.invokeFn<WorktreeInfo>("git_worktree_create", {
+            workspaceDir: repoDir,
+            taskId: `${item.id}-${index + 1}`,
+          });
+          agentDir = wtInfo.path;
+          this.log("info", "Worktree", `Isolated "${item.title}" in ${wtInfo.branch}`);
+        } catch (err) {
+          this.log("warn", "Worktree", `Using shared workspace for "${item.title}": ${String(err)}`);
+        }
+      }
+
+      if (gen !== this.runGeneration) return;
+
+      const subagentId = `sub-${item.id}-${index}`;
+      const pet: PetEntity = {
+        id: subagentId,
+        sessionID: null,
+        kind: "subagent",
+        role: item.role,
+        title: item.title,
+        state: "work",
+        statusText: "Building...",
+        directory: agentDir,
+        repoDir,
+        worktreePath: wtInfo?.path,
+        worktreeBranch: wtInfo?.branch,
+        completed: false,
+        spriteVariant: this.pickSubagentVariant?.(item.role, index),
+      };
+      this.snapshot.subagents.push(pet);
+      this.emit();
+
+      const workerInstruction = [
+        `Role: ${item.role}`,
+        `Task: ${item.title}`,
+        item.branch_or_scope ? `Scope: ${item.branch_or_scope}` : "",
+        "",
+        item.prompt,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      try {
+        const output = await backend.spawnSubagent({
+          parentID: this.masterSessionId ?? undefined,
+          subagentId,
+          role: item.role,
+          title: item.title,
+          directory: agentDir,
+          prompt: workerInstruction,
+          model,
+          signal,
+        });
+        if (gen !== this.runGeneration) return;
+
+        pet.completed = true;
+        this.clearPetPermission(pet);
+        if (pet.state !== "error") {
+          pet.state = "happy";
+          pet.statusText = "Done";
+        }
+        if (output) {
+          pet.lastOutput = output;
+        }
+        if (pet.worktreePath) {
+          const diff = await this.safeInvoke<string>("git_worktree_diff_summary", {
+            worktreePath: pet.worktreePath,
+          });
+          if (diff && !diff.startsWith("No uncommitted changes")) {
+            pet.lastOutput = `${pet.lastOutput ?? ""}\n\n[Worktree ${pet.worktreeBranch ?? ""}]\n${diff}`.trim();
+          }
+        }
+        this.log("success", pet.title, "Completed.");
+        this.emit();
+      } catch (err) {
+        if (gen !== this.runGeneration) return;
+        const msg = err instanceof Error ? err.message : String(err);
+        pet.state = "error";
+        pet.errorText = msg;
+        pet.statusText = "Error";
+        pet.completed = true;
+        this.clearPetPermission(pet);
+        this.log("error", pet.title, msg);
+        this.emit();
+      }
+    };
+
+    try {
+      await Promise.allSettled(plan.map((item, idx) => runOne(item, idx)));
+    } finally {
+      this.isLaunching = false;
+    }
+
+    if (gen !== this.runGeneration) return;
+
+    const activeTurn = this.snapshot.turns.find(
+      (t) => t.id === this.snapshot.currentRunId
+    );
+    if (activeTurn) {
+      activeTurn.subagents = this.snapshot.subagents.map((s) => ({
+        id: s.id,
+        role: s.role,
+        title: s.title,
+        statusText: s.statusText,
+        worktreeBranch: s.worktreeBranch,
+        lastOutput: s.lastOutput,
+        errorText: s.errorText,
+        spriteVariant: s.spriteVariant,
+      }));
+    }
+
+    const allFailed =
+      this.snapshot.subagents.length > 0 &&
+      this.snapshot.subagents.every((s) => s.state === "error");
+
+    this.clearPetPermission(this.snapshot.orchestrator);
+    this.snapshot.streamingActive = false;
+    if (allFailed) {
+      this.snapshot.phase = "error";
+      this.snapshot.orchestrator.state = "error";
+      this.snapshot.orchestrator.statusText = "Error";
+      this.snapshot.orchestrator.errorText =
+        this.snapshot.subagents[0]?.errorText ?? "All subagents failed.";
+    } else {
+      this.snapshot.phase = "idle";
+      this.snapshot.orchestrator.state = "happy";
+      this.snapshot.orchestrator.statusText = "Ready";
+    }
+    this.emit();
   }
 
   private async launchSubagents(plan: SubtaskPlanItem[], gen: number): Promise<void> {
@@ -620,7 +1234,7 @@ export class PetOrchestratorEngine {
 
       if (this.snapshot.useWorktrees && this.snapshot.isGitRepo && plan.length > 1) {
         try {
-          wtInfo = await invoke<WorktreeInfo>("git_worktree_create", {
+          wtInfo = await this.invokeFn<WorktreeInfo>("git_worktree_create", {
             workspaceDir: repoDir,
             taskId: `${item.id}-${index + 1}`,
           });
@@ -655,6 +1269,7 @@ export class PetOrchestratorEngine {
         worktreePath: wtInfo?.path,
         worktreeBranch: wtInfo?.branch,
         completed: false,
+        spriteVariant: this.pickSubagentVariant?.(item.role, index),
       };
       this.snapshot.subagents.push(pet);
       this.emit();
@@ -683,6 +1298,7 @@ export class PetOrchestratorEngine {
         pet.errorText = err instanceof Error ? err.message : String(err);
         pet.statusText = "Dispatch failed";
         pet.completed = true;
+        this.clearPetPermission(pet);
         this.emit();
       }
     };
@@ -701,6 +1317,7 @@ export class PetOrchestratorEngine {
     if (gen !== this.runGeneration) return;
 
     if (this.snapshot.subagents.length === 0) {
+      this.clearPetPermission(this.snapshot.orchestrator);
       this.snapshot.phase = "error";
       this.snapshot.orchestrator.state = "error";
       this.snapshot.orchestrator.errorText = "No sub-agent sessions could be started.";
@@ -717,6 +1334,238 @@ export class PetOrchestratorEngine {
       return this.snapshot.orchestrator;
     }
     return this.snapshot.subagents.find((s) => s.sessionID === sessionID) ?? null;
+  }
+
+  private findPetForNormalizedEvent(ev: {
+    sessionID?: string;
+    petId?: string;
+  }): PetEntity | null {
+    if (ev.petId) {
+      if (ev.petId === "orchestrator") return this.snapshot.orchestrator;
+      const byId = this.snapshot.subagents.find((s) => s.id === ev.petId);
+      if (byId) return byId;
+    }
+    if (ev.sessionID) {
+      return this.findPetBySession(ev.sessionID);
+    }
+    return null;
+  }
+
+  private handleNormalizedEvent(
+    backendId: BackendId,
+    ev: NormalizedAgentEvent
+  ): void {
+    if (this.getActiveBackendId() !== backendId) return;
+    if (this.snapshot.phase === "idle") return;
+
+    switch (ev.type) {
+      case "thought": {
+        const pet = this.findPetForNormalizedEvent(ev);
+        if (!pet || pet.permission || pet.completed) break;
+        const tokKey = ev.sessionID || pet.id;
+        if (!this.stepFirstTokenAt.has(tokKey)) {
+          this.stepFirstTokenAt.set(tokKey, Date.now());
+        }
+        const chars = (this.stepStreamChars.get(tokKey) ?? 0) + ev.text.length;
+        this.stepStreamChars.set(tokKey, chars);
+        const startAt = this.stepFirstTokenAt.get(tokKey) ?? Date.now();
+        const elapsed = Math.max(0.15, (Date.now() - startAt) / 1000);
+        this.snapshot.tokensPerSec = Math.round(((chars / 4) / elapsed) * 10) / 10;
+        this.snapshot.streamingActive = true;
+        pet.state = "work";
+        pet.statusText = "Thinking...";
+        this.emit();
+        break;
+      }
+
+      case "text_delta": {
+        const pet = this.findPetForNormalizedEvent(ev);
+        if (!pet || pet.permission || pet.completed) break;
+        const tokKey = ev.sessionID || pet.id;
+        if (!this.stepFirstTokenAt.has(tokKey)) {
+          this.stepFirstTokenAt.set(tokKey, Date.now());
+        }
+        const chars = (this.stepStreamChars.get(tokKey) ?? 0) + ev.delta.length;
+        this.stepStreamChars.set(tokKey, chars);
+        const startAt = this.stepFirstTokenAt.get(tokKey) ?? Date.now();
+        const elapsed = Math.max(0.15, (Date.now() - startAt) / 1000);
+        this.snapshot.tokensPerSec = Math.round(((chars / 4) / elapsed) * 10) / 10;
+        this.snapshot.streamingActive = true;
+        pet.state = "work";
+        pet.statusText = "Writing response...";
+        this.emit();
+        break;
+      }
+
+      case "tool_start": {
+        const pet = this.findPetForNormalizedEvent(ev);
+        if (!pet || pet.permission || pet.completed) break;
+        pet.state = "work";
+        pet.statusText = formatToolVerb(ev.toolName);
+        this.emit();
+        break;
+      }
+
+      case "tool_end": {
+        const pet = this.findPetForNormalizedEvent(ev);
+        if (!pet || pet.permission || pet.completed) break;
+        pet.statusText = "Thinking...";
+        this.emit();
+        break;
+      }
+
+      case "permission_request": {
+        const pet =
+          this.findPetForNormalizedEvent(ev) ?? this.snapshot.orchestrator;
+        this.attachPermission(pet, {
+          requestId: ev.requestId,
+          sessionID: ev.sessionID || pet.sessionID || "",
+          permission: ev.permission,
+          patterns: ev.patterns,
+          detail: ev.detail,
+          directory: ev.directory || pet.directory || this.snapshot.workspaceDir,
+          isV2: ev.isV2,
+        });
+        break;
+      }
+
+      case "subagent_spawn": {
+        const existing = this.snapshot.subagents.find(
+          (s) => s.id === ev.subagentId
+        );
+        if (existing) {
+          if (!existing.sessionID && ev.sessionID) {
+            existing.sessionID = ev.sessionID;
+          }
+          if (ev.directory && !existing.directory) {
+            existing.directory = ev.directory;
+          }
+          this.emit();
+        } else {
+          const pet: PetEntity = {
+            id: ev.subagentId,
+            sessionID: ev.sessionID || null,
+            kind: "subagent",
+            role: ev.role,
+            title: ev.title,
+            state: "work",
+            statusText: "Building...",
+            directory: ev.directory ?? this.snapshot.workspaceDir,
+            completed: false,
+            spriteVariant: this.pickSubagentVariant?.(
+              ev.role,
+              this.snapshot.subagents.length
+            ),
+          };
+          this.snapshot.subagents.push(pet);
+          this.emit();
+        }
+        break;
+      }
+
+      case "subagent_update": {
+        const sub =
+          this.snapshot.subagents.find((s) => s.id === ev.subagentId) ??
+          (ev.sessionID
+            ? this.snapshot.subagents.find((s) => s.sessionID === ev.sessionID)
+            : undefined);
+        if (!sub) break;
+        if (ev.state === "error") {
+          sub.state = "error";
+          sub.statusText = ev.statusText || "Error";
+          sub.errorText = ev.detail || ev.statusText || "Error";
+          sub.completed = true;
+          this.clearPetPermission(sub);
+        } else if (ev.state === "alert") {
+          sub.state = "alert";
+          if (ev.statusText) sub.statusText = ev.statusText;
+        } else if (!sub.permission) {
+          if (
+            ev.state === "happy" ||
+            (ev.state === "idle" && (ev.statusText === "Done" || sub.completed))
+          ) {
+            sub.state = "happy";
+            sub.statusText = ev.statusText || "Done";
+            sub.completed = true;
+            this.clearPetPermission(sub);
+          } else if (ev.state) {
+            sub.state = ev.state;
+            if (ev.statusText) sub.statusText = ev.statusText;
+          } else if (ev.statusText) {
+            sub.statusText = ev.statusText;
+          }
+        }
+        this.emit();
+        break;
+      }
+
+      case "completed": {
+        this.snapshot.streamingActive = false;
+        const tokKey = ev.sessionID || ev.petId || "";
+        const startAt = tokKey ? this.stepFirstTokenAt.get(tokKey) : undefined;
+        if (ev.usage) {
+          const outTokens =
+            (ev.usage.outputTokens ?? 0) + (ev.usage.reasoningTokens ?? 0);
+          if (outTokens > 0 && startAt) {
+            const elapsed = Math.max(0.1, (Date.now() - startAt) / 1000);
+            this.snapshot.tokensPerSec = Math.round((outTokens / elapsed) * 10) / 10;
+          }
+          this.snapshot.totalTokens +=
+            (ev.usage.inputTokens ?? 0) +
+            (ev.usage.outputTokens ?? 0) +
+            (ev.usage.reasoningTokens ?? 0);
+        }
+        if (tokKey) {
+          this.stepFirstTokenAt.delete(tokKey);
+          this.stepStreamChars.delete(tokKey);
+        }
+
+        const pet = this.findPetForNormalizedEvent(ev);
+        if (pet) {
+          this.clearPetPermission(pet);
+          if (pet.kind === "subagent") {
+            pet.completed = true;
+            if (pet.state !== "error") {
+              pet.state = "happy";
+              pet.statusText = "Done";
+            }
+            if (ev.text) {
+              pet.lastOutput = ev.text;
+            }
+          }
+        }
+        this.emit();
+        break;
+      }
+
+      case "error": {
+        const pet = this.findPetForNormalizedEvent(ev);
+        if (!ev.recoverable) {
+          const tokKey = ev.sessionID || ev.petId || pet?.id || "";
+          if (tokKey) {
+            this.stepFirstTokenAt.delete(tokKey);
+            this.stepStreamChars.delete(tokKey);
+          }
+          if (pet) {
+            pet.state = "error";
+            pet.errorText = ev.message;
+            pet.statusText = "Error";
+            this.clearPetPermission(pet);
+            if (pet.kind === "subagent") {
+              pet.completed = true;
+            } else if (this.snapshot.mode !== "orchestration") {
+              this.snapshot.phase = "error";
+            }
+          }
+          this.snapshot.streamingActive = false;
+          this.log("error", pet?.title ?? backendId, ev.message);
+          this.emit();
+        } else {
+          this.log("warn", pet?.title ?? backendId, ev.message);
+        }
+        break;
+      }
+    }
   }
 
   private handleOpencodeEvent(event: AnyOpencodeEvent): void {
@@ -856,6 +1705,7 @@ export class PetOrchestratorEngine {
         if (!pet || this.snapshot.phase === "idle") break;
         if (pet.kind === "subagent") {
           pet.completed = true;
+          this.clearPetPermission(pet);
           pet.state = "idle";
           pet.statusText = "Interrupted";
           this.emit();
@@ -882,6 +1732,7 @@ export class PetOrchestratorEngine {
         pet.state = "error";
         pet.errorText = msg;
         pet.statusText = "Error";
+        this.clearPetPermission(pet);
         if (pet.kind === "subagent") pet.completed = true;
         this.log("error", pet.title, msg);
         this.emit();
@@ -1029,11 +1880,27 @@ export class PetOrchestratorEngine {
     this.emit();
   }
 
+  private clearPetPermission(pet: PetEntity): void {
+    const reqId = pet.permission?.requestId;
+    const sid = pet.sessionID;
+    pet.permission = undefined;
+    if (!reqId && !sid) return;
+    this.snapshot.activePermissions = this.snapshot.activePermissions.filter(
+      (p) => (!reqId || p.requestId !== reqId) && (!sid || p.sessionID !== sid)
+    );
+  }
+
   private clearPermission(sessionID: string, requestID: string): void {
     this.snapshot.activePermissions = this.snapshot.activePermissions.filter(
       (x) => x.requestId !== requestID
     );
-    const pet = this.findPetBySession(sessionID);
+    const pet =
+      this.findPetBySession(sessionID) ??
+      (this.snapshot.orchestrator.permission?.requestId === requestID
+        ? this.snapshot.orchestrator
+        : this.snapshot.subagents.find(
+            (s) => s.permission?.requestId === requestID
+          ) ?? null);
     if (pet && pet.permission?.requestId === requestID) {
       pet.permission = undefined;
       if (!pet.completed && pet.state === "alert") {
@@ -1050,17 +1917,35 @@ export class PetOrchestratorEngine {
     reply: "once" | "always" | "reject"
   ): Promise<void> {
     const req = this.snapshot.activePermissions.find((p) => p.requestId === requestId);
-    const pet = this.findPetBySession(sessionID);
+    const pet =
+      this.findPetBySession(sessionID) ??
+      (this.snapshot.orchestrator.permission?.requestId === requestId
+        ? this.snapshot.orchestrator
+        : this.snapshot.subagents.find(
+            (s) => s.permission?.requestId === requestId
+          ) ?? null);
     const directory = req?.directory ?? pet?.directory ?? this.snapshot.workspaceDir;
 
-    await this.connection.replyPermission({
-      sessionID,
-      requestID: requestId,
-      reply,
-      directory,
-      isV2: req?.isV2,
-      message: reply === "reject" ? "Denied via Boymoder AI Assistant" : undefined,
-    });
+    if (this.isNativeOpencode()) {
+      await this.connection.replyPermission({
+        sessionID,
+        requestID: requestId,
+        reply,
+        directory,
+        isV2: req?.isV2,
+        message: reply === "reject" ? "Denied via Boymoder AI Assistant" : undefined,
+      });
+    } else {
+      const backend = this.backends[this.getActiveBackendId()];
+      await backend.respondToPermission({
+        sessionID,
+        requestId,
+        reply,
+        directory,
+        isV2: req?.isV2,
+        message: reply === "reject" ? "Denied via Boymoder AI Assistant" : undefined,
+      });
+    }
 
     this.log(
       reply === "reject" ? "warn" : "success",
@@ -1073,9 +1958,9 @@ export class PetOrchestratorEngine {
   private markSubagentIdle(pet: PetEntity): void {
     if (pet.completed) return;
     pet.completed = true;
-    pet.permission = undefined;
+    this.clearPetPermission(pet);
     if (pet.state !== "error") {
-      pet.state = "idle";
+      pet.state = "happy";
       pet.statusText = "Done";
     }
     this.log("success", pet.title, "Completed.");
@@ -1107,15 +1992,11 @@ export class PetOrchestratorEngine {
       }
 
       if (sub.worktreePath) {
-        try {
-          const diff = await invoke<string>("git_worktree_diff_summary", {
-            worktreePath: sub.worktreePath,
-          });
-          if (diff && !diff.startsWith("No uncommitted changes")) {
-            sub.lastOutput = `${sub.lastOutput ?? ""}\n\n[Worktree ${sub.worktreeBranch ?? ""}]\n${diff}`.trim();
-          }
-        } catch {
-          // Ignore worktree diff error
+        const diff = await this.safeInvoke<string>("git_worktree_diff_summary", {
+          worktreePath: sub.worktreePath,
+        });
+        if (diff && !diff.startsWith("No uncommitted changes")) {
+          sub.lastOutput = `${sub.lastOutput ?? ""}\n\n[Worktree ${sub.worktreeBranch ?? ""}]\n${diff}`.trim();
         }
       }
     }
@@ -1133,14 +2014,28 @@ export class PetOrchestratorEngine {
         worktreeBranch: s.worktreeBranch,
         lastOutput: s.lastOutput,
         errorText: s.errorText,
+        spriteVariant: s.spriteVariant,
       }));
     }
-    this.snapshot.phase = "idle";
-    this.snapshot.orchestrator.state = "idle";
-    this.snapshot.orchestrator.statusText = "Ready";
+    const allFailed =
+      this.snapshot.subagents.length > 0 &&
+      this.snapshot.subagents.every((s) => s.state === "error");
+
+    this.clearPetPermission(this.snapshot.orchestrator);
+    if (allFailed) {
+      this.snapshot.phase = "error";
+      this.snapshot.orchestrator.state = "error";
+      this.snapshot.orchestrator.statusText = "Error";
+      this.snapshot.orchestrator.errorText =
+        this.snapshot.subagents[0]?.errorText ?? "All subagents failed.";
+    } else {
+      this.snapshot.phase = "idle";
+      this.snapshot.orchestrator.state = "happy";
+      this.snapshot.orchestrator.statusText = "Ready";
+    }
     this.snapshot.subagents = this.snapshot.subagents.map((s) => ({
       ...s,
-      state: s.state === "error" ? "error" : "idle",
+      state: s.state === "error" ? "error" : "happy",
     }));
     this.emit();
   }
@@ -1155,23 +2050,31 @@ export class PetOrchestratorEngine {
     this.runGeneration += 1;
     this.isLaunching = false;
     this.collectingOutputs = false;
+    this.runAbortController?.abort();
+    this.runAbortController = null;
+
     for (const [sid] of this.sessionIdleWaiters) {
       this.resolveSessionIdleWaiter(sid, "Aborted");
     }
 
-    const sessions: Array<{ id: string; dir: string }> = [];
-    if (this.masterSessionId) {
-      sessions.push({ id: this.masterSessionId, dir: this.snapshot.workspaceDir });
-    }
-    for (const sub of this.snapshot.subagents) {
-      if (sub.sessionID && !sub.completed) {
-        sessions.push({ id: sub.sessionID, dir: sub.directory });
+    if (this.isNativeOpencode()) {
+      const sessions: Array<{ id: string; dir: string }> = [];
+      if (this.masterSessionId) {
+        sessions.push({ id: this.masterSessionId, dir: this.snapshot.workspaceDir });
       }
-    }
+      for (const sub of this.snapshot.subagents) {
+        if (sub.sessionID && !sub.completed) {
+          sessions.push({ id: sub.sessionID, dir: sub.directory });
+        }
+      }
 
-    await Promise.allSettled(
-      sessions.map(({ id, dir }) => this.connection.abortSession(id, dir))
-    );
+      await Promise.allSettled(
+        sessions.map(({ id, dir }) => this.connection.abortSession(id, dir))
+      );
+    } else {
+      const backend = this.backends[this.getActiveBackendId()];
+      await Promise.allSettled([backend.abort()]);
+    }
 
     this.snapshot.phase = "idle";
     this.snapshot.streamingActive = false;
@@ -1180,6 +2083,7 @@ export class PetOrchestratorEngine {
     this.snapshot.orchestrator.statusText = "Stopped";
     this.snapshot.orchestrator.bubbleText = undefined;
     this.snapshot.orchestrator.errorText = undefined;
+    this.snapshot.orchestrator.permission = undefined;
     this.snapshot.subagents = this.snapshot.subagents.map((s) => ({
       ...s,
       completed: true,
@@ -1195,16 +2099,12 @@ export class PetOrchestratorEngine {
     for (const sub of this.snapshot.subagents) {
       const repoDir = sub.repoDir ?? this.snapshot.workspaceDir;
       if (sub.worktreePath && repoDir) {
-        try {
-          await invoke("git_worktree_remove", {
-            workspaceDir: repoDir,
-            worktreePath: sub.worktreePath,
-            branch: sub.worktreeBranch ?? null,
-            force: false,
-          });
-        } catch {
-          // Leave dirty worktrees intact so user work isn't lost.
-        }
+        await this.safeInvoke("git_worktree_remove", {
+          workspaceDir: repoDir,
+          worktreePath: sub.worktreePath,
+          branch: sub.worktreeBranch ?? null,
+          force: false,
+        });
       }
     }
   }

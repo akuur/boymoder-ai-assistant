@@ -81,6 +81,9 @@ pub fn run() {
             commands::scan_pet_sprites,
             commands::spawn_opencode_serve,
             commands::stop_opencode_serve,
+            commands::check_agent_cli_availability,
+            commands::spawn_agent_cli,
+            commands::kill_agent_cli,
             commands::git_is_repo,
             commands::git_worktree_create,
             commands::git_worktree_remove,
@@ -112,6 +115,12 @@ pub fn run() {
             start_cursor_hitbox_loop(app.handle().clone());
             #[cfg(target_os = "linux")]
             {
+                use gtk::prelude::GtkWindowExt as _;
+                if let Some(main_win) = app.get_webview_window("main") {
+                    if let Ok(gtk_win) = main_win.gtk_window() {
+                        gtk_win.set_icon_name(Some("boymoder-ai-assistant"));
+                    }
+                }
                 if let Some(overlay) = app.get_webview_window("overlay") {
                     if let Ok(gtk_win) = overlay.gtk_window() {
                         crate::layer_shell::init_overlay_layer(&gtk_win);
@@ -125,18 +134,20 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if let RunEvent::Exit = event {
-            let child_opt = {
+            let (child_opt, agent_clis_arc) = {
                 let state = app_handle.state::<AppState>();
-                state
+                let opencode = state
                     .opencode_child
                     .lock()
                     .ok()
-                    .and_then(|mut guard| guard.take())
+                    .and_then(|mut guard| guard.take());
+                (opencode, std::sync::Arc::clone(&state.agent_clis))
             };
             if let Some(mut child) = child_opt {
                 let _ = child.kill();
                 let _ = child.wait();
             }
+            commands::kill_all_agent_clis_in_map(&agent_clis_arc);
         }
     });
 }

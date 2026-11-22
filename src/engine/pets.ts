@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { PetAnimState, PetRoleKind, PetSpritePack } from "./types";
+import type { PetAnimState, PetRoleKind, PetSpritePack } from "./types.ts";
 
 function makeSvgFallback(label: string, color: string): string {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160"><circle cx="80" cy="80" r="64" fill="${color}" stroke="#ffffff" stroke-width="6"/><text x="80" y="88" font-family="sans-serif" font-size="22" font-weight="bold" fill="#ffffff" text-anchor="middle">${label}</text></svg>`;
@@ -19,7 +19,9 @@ const DEFAULT_FALLBACK_PACK: PetSpritePack = {
       idle: makeSvgFallback("SUB", "#14b8a6"),
       walk: makeSvgFallback("WALK", "#0d9488"),
       work: makeSvgFallback("DEV", "#0f766e"),
+      sleep: makeSvgFallback("ZZZ", "#6366f1"),
       alert: makeSvgFallback("!", "#f59e0b"),
+      happy: makeSvgFallback("YAY", "#22c55e"),
     },
   },
 };
@@ -51,6 +53,39 @@ export class PetSpriteRegistry {
 
   setPack(pack: PetSpritePack): void {
     this.pack = pack;
+  }
+
+  listSubagentVariants(): string[] {
+    return Object.keys(this.pack.subagents).sort();
+  }
+
+  pickSubagentVariant(requestedRole: string, index = 0): string {
+    const subagents = this.pack.subagents;
+    const normalizedRole = requestedRole.trim().toLowerCase();
+    const keys = Object.keys(subagents).sort();
+    const nonDefaultKeys = keys.filter((key) => key !== "default");
+
+    if (normalizedRole) {
+      if (normalizedRole !== "default" && subagents[normalizedRole]) {
+        return normalizedRole;
+      }
+      const fuzzyMatch = nonDefaultKeys.find(
+        (key) => normalizedRole.includes(key) || key.includes(normalizedRole)
+      );
+      if (fuzzyMatch) {
+        return fuzzyMatch;
+      }
+    }
+
+    if (nonDefaultKeys.length > 0) {
+      const safeIndex = Number.isFinite(index) ? Math.abs(Math.trunc(index)) : 0;
+      return nonDefaultKeys[safeIndex % nonDefaultKeys.length];
+    }
+
+    if (subagents["default"]) {
+      return "default";
+    }
+    return keys[0] ?? "default";
   }
 
   resolveSpriteFrames(kind: PetRoleKind, role: string, state: PetAnimState): string[] {
@@ -174,20 +209,20 @@ export class PetSpriteRegistry {
     }
 
     if (roleMap[state]) return roleMap[state];
-    if (state === "error") return roleMap["error"] ?? roleMap["alert"] ?? roleMap["idle"];
-    if (state === "fall") return roleMap["alert"] ?? roleMap["idle"];
-    if (state === "sit" || state === "sleep" || state === "happy" || state === "phone") {
-      return roleMap["idle"];
-    }
-    if (state === "chat") {
-      return roleMap["sit"] ?? roleMap["work"] ?? roleMap["idle"];
-    }
-    if (state === "walk") return roleMap["work"] ?? roleMap["idle"];
-    if (state === "work") return roleMap["walk"] ?? roleMap["idle"];
-    return (
+    const fallbackIdle =
       roleMap["idle"] ??
       Object.values(roleMap)[0] ??
-      DEFAULT_FALLBACK_PACK.subagents.default.idle
-    );
+      DEFAULT_FALLBACK_PACK.subagents.default.idle;
+    if (state === "error") return roleMap["error"] ?? roleMap["alert"] ?? fallbackIdle;
+    if (state === "fall") return roleMap["fall"] ?? roleMap["alert"] ?? fallbackIdle;
+    if (state === "walk") return roleMap["walk"] ?? roleMap["work"] ?? fallbackIdle;
+    if (state === "sit" || state === "sleep" || state === "happy" || state === "phone") {
+      return roleMap[state] ?? fallbackIdle;
+    }
+    if (state === "chat") {
+      return roleMap["chat"] ?? roleMap["sit"] ?? roleMap["work"] ?? fallbackIdle;
+    }
+    if (state === "work") return roleMap["work"] ?? roleMap["walk"] ?? fallbackIdle;
+    return fallbackIdle;
   }
 }

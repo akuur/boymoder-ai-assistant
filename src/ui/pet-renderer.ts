@@ -96,9 +96,10 @@ export function createOrUpdatePetElement(
   }
 
   const img = spriteWrap.querySelector<HTMLImageElement>("img.pet-sprite")!;
+  const spriteRole = pet.spriteVariant || pet.role;
   const targetUrl = sprites.resolveAnimatedSpriteUrl(
     pet.kind,
-    pet.role,
+    spriteRole,
     effectiveState,
     nowMs ?? performance.now()
   );

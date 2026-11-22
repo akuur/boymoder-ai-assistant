@@ -3,13 +3,16 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, State};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -799,9 +802,492 @@ pub fn git_worktree_diff_summary(worktree_path: String) -> Result<String, String
     }
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CliAvailabilityResult {
+    pub binary: String,
+    pub available: bool,
+    pub path: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CliStreamEvent {
+    pub run_id: String,
+    pub stream: String,
+    pub line: Option<String>,
+    pub code: Option<i32>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpawnCliResult {
+    pub run_id: String,
+    pub binary: String,
+    pub pid: u32,
+    pub path: String,
+}
+
+pub fn validate_cli_binary(binary: &str) -> Result<&'static str, String> {
+    match binary.trim() {
+        "claude" => Ok("claude"),
+        "codex" => Ok("codex"),
+        _ => Err(format!("Disallowed CLI binary: {binary}")),
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn resolve_cli_binary_in_path(binary: &str, search_path: Option<&OsStr>) -> Option<PathBuf> {
+    let allowed = validate_cli_binary(binary).ok()?;
+    let env_path = if search_path.is_none() {
+        std::env::var_os("PATH")
+    } else {
+        None
+    };
+    let effective_path = search_path.or(env_path.as_deref())?;
+
+    for dir in std::env::split_paths(effective_path) {
+        if dir.as_os_str().is_empty() || !dir.is_dir() {
+            continue;
+        }
+        #[cfg(windows)]
+        let candidates = [
+            format!("{allowed}.exe"),
+            format!("{allowed}.cmd"),
+            format!("{allowed}.bat"),
+            allowed.to_string(),
+        ];
+        #[cfg(not(windows))]
+        let candidates = [allowed];
+
+        for name in candidates {
+            let candidate = dir.join(name);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn build_search_path(custom_dir: Option<&str>) -> Result<Option<OsString>, String> {
+    let Some(raw_dir) = custom_dir.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let custom_path = PathBuf::from(raw_dir);
+    if !custom_path.is_dir() {
+        return Err(format!(
+            "Custom CLI directory does not exist: {}",
+            custom_path.display()
+        ));
+    }
+
+    let mut dirs = vec![custom_path];
+    if let Some(existing_path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&existing_path));
+    }
+    std::env::join_paths(dirs)
+        .map(Some)
+        .map_err(|e| format!("Failed to construct CLI search PATH: {e}"))
+}
+
+pub fn check_agent_cli_with_path(
+    binary: &str,
+    search_path: Option<&OsStr>,
+) -> Result<CliAvailabilityResult, String> {
+    let allowed = validate_cli_binary(binary)?;
+    match resolve_cli_binary_in_path(allowed, search_path) {
+        Some(path) => Ok(CliAvailabilityResult {
+            binary: allowed.to_string(),
+            available: true,
+            path: Some(path.to_string_lossy().to_string()),
+            error: None,
+        }),
+        None => Ok(CliAvailabilityResult {
+            binary: allowed.to_string(),
+            available: false,
+            path: None,
+            error: Some(format!("`{allowed}` CLI was not found on PATH")),
+        }),
+    }
+}
+
+#[tauri::command]
+pub fn check_agent_cli_availability(
+    binary: String,
+    custom_dir: Option<String>,
+) -> Result<CliAvailabilityResult, String> {
+    let allowed = validate_cli_binary(&binary)?;
+    let search_path = build_search_path(custom_dir.as_deref())?;
+    check_agent_cli_with_path(allowed, search_path.as_deref())
+}
+
+fn stream_pipe_lines<R: Read>(
+    reader: R,
+    run_id: &str,
+    stream_name: &str,
+    emit_fn: &(impl Fn(CliStreamEvent) + Send + Sync),
+) {
+    let mut buf_reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match buf_reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                let line = String::from_utf8_lossy(&buf).into_owned();
+                emit_fn(CliStreamEvent {
+                    run_id: run_id.to_string(),
+                    stream: stream_name.to_string(),
+                    line: Some(line),
+                    code: None,
+                    error: None,
+                });
+            }
+            Err(err) => {
+                emit_fn(CliStreamEvent {
+                    run_id: run_id.to_string(),
+                    stream: "error".to_string(),
+                    line: None,
+                    code: None,
+                    error: Some(format!("Failed reading {stream_name}: {err}")),
+                });
+                break;
+            }
+        }
+    }
+}
+
+pub fn spawn_agent_cli_with_sink<F>(
+    agent_clis: &Arc<Mutex<HashMap<String, Child>>>,
+    run_id: String,
+    binary: String,
+    args: Vec<String>,
+    cwd: String,
+    custom_path_env: Option<&OsStr>,
+    emit_fn: F,
+) -> Result<SpawnCliResult, String>
+where
+    F: Fn(CliStreamEvent) + Send + Sync + Clone + 'static,
+{
+    let allowed = validate_cli_binary(&binary)?;
+    if run_id.trim().is_empty() {
+        return Err("run_id must not be empty".to_string());
+    }
+
+    let resolved_path = resolve_cli_binary_in_path(allowed, custom_path_env)
+        .ok_or_else(|| format!("`{allowed}` CLI was not found on PATH"))?;
+
+    let work_dir = if cwd.trim().is_empty() {
+        default_home_dir()
+    } else {
+        PathBuf::from(cwd.trim())
+    };
+    if !work_dir.is_dir() {
+        return Err(format!(
+            "Working directory does not exist: {}",
+            work_dir.display()
+        ));
+    }
+
+    {
+        let guard = agent_clis
+            .lock()
+            .map_err(|_| "Failed to lock agent CLI process map".to_string())?;
+        if guard.contains_key(&run_id) {
+            return Err(format!("Agent CLI run `{run_id}` is already active"));
+        }
+    }
+
+    let mut cmd = Command::new(&resolved_path);
+    cmd.args(&args)
+        .current_dir(&work_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(path_env) = custom_path_env {
+        cmd.env("PATH", path_env);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        format!(
+            "Failed to spawn `{allowed}` at {}: {e}",
+            resolved_path.display()
+        )
+    })?;
+
+    let pid = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    {
+        let mut guard = agent_clis
+            .lock()
+            .map_err(|_| "Failed to lock agent CLI process map".to_string())?;
+        if guard.contains_key(&run_id) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Agent CLI run `{run_id}` is already active"));
+        }
+        guard.insert(run_id.clone(), child);
+    }
+
+    let stdout_handle = stdout.map(|out| {
+        let rid = run_id.clone();
+        let emit = emit_fn.clone();
+        std::thread::spawn(move || {
+            stream_pipe_lines(out, &rid, "stdout", &emit);
+        })
+    });
+
+    let stderr_handle = stderr.map(|err| {
+        let rid = run_id.clone();
+        let emit = emit_fn.clone();
+        std::thread::spawn(move || {
+            stream_pipe_lines(err, &rid, "stderr", &emit);
+        })
+    });
+
+    let clis_ref = Arc::clone(agent_clis);
+    let rid_exit = run_id.clone();
+    std::thread::spawn(move || {
+        if let Some(handle) = stdout_handle {
+            let _ = handle.join();
+        }
+        if let Some(handle) = stderr_handle {
+            let _ = handle.join();
+        }
+
+        let child_opt = clis_ref
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.remove(&rid_exit));
+
+        match child_opt {
+            Some(mut child) => match child.wait() {
+                Ok(status) => {
+                    emit_fn(CliStreamEvent {
+                        run_id: rid_exit,
+                        stream: "exit".to_string(),
+                        line: None,
+                        code: status.code(),
+                        error: None,
+                    });
+                }
+                Err(err) => {
+                    emit_fn(CliStreamEvent {
+                        run_id: rid_exit.clone(),
+                        stream: "error".to_string(),
+                        line: None,
+                        code: None,
+                        error: Some(format!("Failed waiting for process: {err}")),
+                    });
+                    emit_fn(CliStreamEvent {
+                        run_id: rid_exit,
+                        stream: "exit".to_string(),
+                        line: None,
+                        code: None,
+                        error: None,
+                    });
+                }
+            },
+            None => {
+                // Already removed and killed by `kill_agent_cli`.
+                emit_fn(CliStreamEvent {
+                    run_id: rid_exit,
+                    stream: "exit".to_string(),
+                    line: None,
+                    code: None,
+                    error: None,
+                });
+            }
+        }
+    });
+
+    Ok(SpawnCliResult {
+        run_id,
+        binary: allowed.to_string(),
+        pid,
+        path: resolved_path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+pub fn spawn_agent_cli(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    run_id: String,
+    binary: String,
+    args: Vec<String>,
+    cwd: String,
+    custom_dir: Option<String>,
+) -> Result<SpawnCliResult, String> {
+    let custom_path_env = build_search_path(custom_dir.as_deref())?;
+    let topic = format!("cli-stream:{run_id}");
+    spawn_agent_cli_with_sink(
+        &state.agent_clis,
+        run_id,
+        binary,
+        args,
+        cwd,
+        custom_path_env.as_deref(),
+        move |payload| {
+            let _ = app.emit(&topic, payload);
+        },
+    )
+}
+
+fn terminate_agent_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as libc::pid_t;
+        if pgid > 0 {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+pub fn kill_agent_cli_in_map(
+    agent_clis: &Mutex<HashMap<String, Child>>,
+    run_id: &str,
+) -> Result<bool, String> {
+    let child_opt = {
+        let mut guard = agent_clis
+            .lock()
+            .map_err(|_| "Failed to lock agent CLI process map".to_string())?;
+        guard.remove(run_id)
+    };
+    if let Some(mut child) = child_opt {
+        terminate_agent_child(&mut child);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+pub fn kill_all_agent_clis_in_map(agent_clis: &Mutex<HashMap<String, Child>>) {
+    let children = agent_clis
+        .lock()
+        .ok()
+        .map(|mut guard| guard.drain().map(|(_, child)| child).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for mut child in children {
+        terminate_agent_child(&mut child);
+    }
+}
+
+#[tauri::command]
+pub fn kill_agent_cli(state: State<'_, AppState>, run_id: String) -> Result<bool, String> {
+    kill_agent_cli_in_map(&state.agent_clis, &run_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new(prefix: &str) -> Self {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let seq = WORKTREE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "boymoder-cli-test-{prefix}-{}-{seq}-{ts}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("failed to create temp test dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_mock_executable(dir: &Path, name: &str, unix_script: &str, win_script: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join(format!("{name}.cmd"));
+            fs::write(&p, win_script).expect("failed to write mock cmd script");
+            let _ = unix_script;
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            let p = dir.join(name);
+            fs::write(&p, unix_script).expect("failed to write mock shell script");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&p).expect("metadata").permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&p, perms).expect("chmod");
+            }
+            let _ = win_script;
+            p
+        }
+    }
+
+    fn wait_for_events(
+        events: &Arc<Mutex<Vec<CliStreamEvent>>>,
+        timeout: Duration,
+        predicate: impl Fn(&[CliStreamEvent]) -> bool,
+    ) -> Vec<CliStreamEvent> {
+        let start = Instant::now();
+        loop {
+            let snapshot = events.lock().expect("events lock").clone();
+            if predicate(&snapshot) || start.elapsed() >= timeout {
+                return snapshot;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     #[test]
     fn sanitize_slug_truncates_and_cleans() {
@@ -820,5 +1306,236 @@ mod tests {
         )
         .is_err());
         assert!(validate_managed_worktree_path(&base, &base).is_err());
+    }
+
+    #[test]
+    fn binary_allowlist_enforced() {
+        assert_eq!(validate_cli_binary("claude"), Ok("claude"));
+        assert_eq!(validate_cli_binary("codex"), Ok("codex"));
+
+        for disallowed in [
+            "rm",
+            "bash",
+            "sh",
+            "cmd",
+            "powershell",
+            "/bin/sh",
+            "../claude",
+            "..\\claude",
+            "claude --version",
+            "claude/sub",
+            "",
+            "   ",
+        ] {
+            assert!(
+                validate_cli_binary(disallowed).is_err(),
+                "expected `{disallowed}` to be rejected"
+            );
+        }
+
+        let map = Arc::new(Mutex::new(HashMap::new()));
+        let events = Arc::new(Mutex::new(Vec::<CliStreamEvent>::new()));
+        let temp = TempDirGuard::new("allowlist");
+
+        for disallowed in ["rm", "bash"] {
+            let sink = Arc::clone(&events);
+            let res = spawn_agent_cli_with_sink(
+                &map,
+                format!("run-{disallowed}"),
+                disallowed.to_string(),
+                vec![],
+                temp.path.to_string_lossy().to_string(),
+                Some(temp.path.as_os_str()),
+                move |ev| {
+                    sink.lock().expect("events lock").push(ev);
+                },
+            );
+            assert!(res.is_err(), "expected spawn for `{disallowed}` to fail");
+        }
+        assert!(events.lock().expect("events lock").is_empty());
+    }
+
+    #[test]
+    fn missing_binary_returns_graceful_unavailable_status() {
+        let empty_dir = TempDirGuard::new("missing");
+
+        for binary in ["claude", "codex"] {
+            let res = check_agent_cli_with_path(binary, Some(empty_dir.path.as_os_str()))
+                .expect("missing binary must return Ok, not Err");
+            assert_eq!(res.binary, binary);
+            assert!(!res.available);
+            assert_eq!(res.path, None);
+            assert!(
+                res.error.as_deref().is_some_and(|msg| !msg.is_empty()),
+                "expected descriptive error message for missing `{binary}`"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let non_exec = empty_dir.path.join("claude");
+            fs::write(&non_exec, "#!/bin/sh\necho hi\n").expect("write non-exec");
+            let mut perms = fs::metadata(&non_exec).expect("metadata").permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(&non_exec, perms).expect("chmod 644");
+
+            let res = check_agent_cli_with_path("claude", Some(empty_dir.path.as_os_str()))
+                .expect("non-exec binary check must return Ok");
+            assert!(!res.available);
+            assert_eq!(res.path, None);
+        }
+    }
+
+    #[test]
+    fn streams_lines_and_kills_long_running_claude_cli() {
+        let temp = TempDirGuard::new("stream-kill");
+        let work_dir = TempDirGuard::new("stream-kill-cwd");
+        write_mock_executable(
+            &temp.path,
+            "mock-node-helper",
+            "#!/bin/sh\nprintf '{\"type\":\"init\"}\\n'\n",
+            "@echo off\r\necho {\"type\":\"init\"}\r\n",
+        );
+        let script_path = write_mock_executable(
+            &temp.path,
+            "claude",
+            "#!/bin/sh\nmock-node-helper\nprintf '{\"type\":\"delta\",\"text\":\"hi\"}\\n'\nprintf 'stderr-line-1\\n' >&2\nsleep 10\n",
+            "@echo off\r\ncall mock-node-helper.cmd\r\necho {\"type\":\"delta\",\"text\":\"hi\"}\r\necho stderr-line-1 1>&2\r\nping -n 11 127.0.0.1 >nul\r\n",
+        );
+
+        let search_path = build_search_path(Some(temp.path.to_string_lossy().as_ref()))
+            .expect("build search path")
+            .expect("custom search path");
+
+        let avail = check_agent_cli_with_path("claude", Some(search_path.as_os_str()))
+            .expect("availability check");
+        assert!(avail.available);
+        assert_eq!(
+            avail.path.as_deref(),
+            Some(script_path.to_string_lossy().as_ref())
+        );
+
+        let map = Arc::new(Mutex::new(HashMap::new()));
+        let events = Arc::new(Mutex::new(Vec::<CliStreamEvent>::new()));
+        let sink = Arc::clone(&events);
+        let run_id = "run-claude-kill".to_string();
+
+        let spawn_res = spawn_agent_cli_with_sink(
+            &map,
+            run_id.clone(),
+            "claude".to_string(),
+            vec!["--print".to_string()],
+            work_dir.path.to_string_lossy().to_string(),
+            Some(search_path.as_os_str()),
+            move |ev| {
+                sink.lock().expect("events lock").push(ev);
+            },
+        )
+        .expect("spawn claude mock");
+        assert_eq!(spawn_res.run_id, run_id);
+        assert_eq!(spawn_res.binary, "claude");
+        assert!(spawn_res.pid > 0);
+
+        // Verify lines stream BEFORE the process exits (while sleeping).
+        let streamed = wait_for_events(&events, Duration::from_secs(3), |evs| {
+            let stdout_count = evs.iter().filter(|e| e.stream == "stdout").count();
+            let stderr_count = evs.iter().filter(|e| e.stream == "stderr").count();
+            stdout_count >= 2 && stderr_count >= 1
+        });
+
+        let stdout_lines: Vec<String> = streamed
+            .iter()
+            .filter(|e| e.stream == "stdout")
+            .filter_map(|e| e.line.clone())
+            .collect();
+        let stderr_lines: Vec<String> = streamed
+            .iter()
+            .filter(|e| e.stream == "stderr")
+            .filter_map(|e| e.line.clone())
+            .collect();
+        assert_eq!(
+            stdout_lines,
+            vec![
+                "{\"type\":\"init\"}".to_string(),
+                "{\"type\":\"delta\",\"text\":\"hi\"}".to_string(),
+            ]
+        );
+        assert_eq!(stderr_lines, vec!["stderr-line-1".to_string()]);
+        assert!(
+            !streamed.iter().any(|e| e.stream == "exit"),
+            "process should still be running prior to kill"
+        );
+
+        // Kill the active process and confirm clean termination.
+        let killed = kill_agent_cli_in_map(&map, &run_id).expect("kill call");
+        assert!(killed);
+        let killed_again = kill_agent_cli_in_map(&map, &run_id).expect("second kill call");
+        assert!(!killed_again);
+
+        let after_kill = wait_for_events(&events, Duration::from_secs(3), |evs| {
+            evs.iter().any(|e| e.stream == "exit")
+        });
+        assert!(after_kill.iter().any(|e| e.stream == "exit"));
+    }
+
+    #[test]
+    fn streams_short_lived_codex_cli_and_emits_exit_zero() {
+        let temp = TempDirGuard::new("codex-exit");
+        write_mock_executable(
+            &temp.path,
+            "codex",
+            "#!/bin/sh\nprintf 'codex-out-1\\n'\nprintf 'codex-out-2\\n'\nprintf 'codex-err-1\\n' >&2\nexit 0\n",
+            "@echo off\r\necho codex-out-1\r\necho codex-out-2\r\necho codex-err-1 1>&2\r\nexit /b 0\r\n",
+        );
+
+        let map = Arc::new(Mutex::new(HashMap::new()));
+        let events = Arc::new(Mutex::new(Vec::<CliStreamEvent>::new()));
+        let sink = Arc::clone(&events);
+        let run_id = "run-codex-short".to_string();
+
+        spawn_agent_cli_with_sink(
+            &map,
+            run_id.clone(),
+            "codex".to_string(),
+            vec![],
+            temp.path.to_string_lossy().to_string(),
+            Some(temp.path.as_os_str()),
+            move |ev| {
+                sink.lock().expect("events lock").push(ev);
+            },
+        )
+        .expect("spawn codex mock");
+
+        let final_events = wait_for_events(&events, Duration::from_secs(3), |evs| {
+            evs.iter().any(|e| e.stream == "exit")
+        });
+
+        let stdout_lines: Vec<String> = final_events
+            .iter()
+            .filter(|e| e.stream == "stdout")
+            .filter_map(|e| e.line.clone())
+            .collect();
+        let stderr_lines: Vec<String> = final_events
+            .iter()
+            .filter(|e| e.stream == "stderr")
+            .filter_map(|e| e.line.clone())
+            .collect();
+        assert_eq!(
+            stdout_lines,
+            vec!["codex-out-1".to_string(), "codex-out-2".to_string()]
+        );
+        assert_eq!(stderr_lines, vec!["codex-err-1".to_string()]);
+
+        let exit_idx = final_events
+            .iter()
+            .position(|e| e.stream == "exit")
+            .expect("exit event expected");
+        assert_eq!(exit_idx, final_events.len() - 1);
+        assert_eq!(final_events[exit_idx].code, Some(0));
+        assert_eq!(final_events[exit_idx].run_id, run_id);
+
+        // Map should be cleaned up automatically after exit.
+        assert!(map.lock().expect("map lock").is_empty());
     }
 }

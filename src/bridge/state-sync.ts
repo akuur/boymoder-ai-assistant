@@ -13,7 +13,9 @@ export interface PetDropOrigin {
 
 export async function broadcastState(snapshot: OrchestratorSnapshot): Promise<void> {
   try {
-    await emit(EVENT_STATE_SYNC, snapshot);
+    const { backendConfigs: _omitted, ...rest } = snapshot;
+    const sanitized: OrchestratorSnapshot = rest;
+    await emit(EVENT_STATE_SYNC, sanitized);
   } catch {
     // Ignore when running outside Tauri
   }
