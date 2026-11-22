@@ -101,6 +101,26 @@ the 9 core poses are **`idle`**, **`walk`**, **`work`**, **`fall`**, **`sit`**, 
 
 ---
 
+## building & releasing
+
+if you want to build installers locally for your current OS:
+
+```bash
+npm run tauri build
+```
+
+to trigger an automated multi-platform GitHub Release (`.AppImage` & `.deb` for Linux, `.msi` & `.exe` for Windows, and unsigned universal `.dmg` / `.app` for macOS) via `.github/workflows/release.yml`:
+
+1. bump `"version"` in `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` to match (e.g. `0.1.0`).
+2. commit, tag, and push the version tag:
+   ```bash
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+3. the workflow creates a draft release named `Boymoder AI Assistant v0.1.0` with all platform artifacts attached (you can also trigger it manually from GitHub Actions via **Run workflow**).
+
+---
+
 ## license
 
 [MIT](LICENSE)
